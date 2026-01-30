@@ -1,184 +1,197 @@
-#include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_MCP23X17.h>
 #include <Adafruit_ADS1X15.h>
 #include <Adafruit_VEML7700.h>
+#include <Adafruit_NeoPixel.h>
 
-// ================= PIN MAP =================
-#define PIN_PIEZO_X 9
-#define PIN_PIEZO_Y 10
+// ---------------- I2C devices ----------------
+Adafruit_MCP23X17 mcp;     // 0x20
+Adafruit_ADS1115 ads0;    // 0x48
+Adafruit_ADS1115 ads1;    // 0x49
+Adafruit_VEML7700 veml;   // 0x10 default
 
-#define ADC_ECHO 0  // GPIO0
+// ---------------- WS2812 ----------------
+#define PIN_RGBLED_DIN 8
+#define LED_COUNT 5
+Adafruit_NeoPixel strip(LED_COUNT, PIN_RGBLED_DIN, NEO_GRB + NEO_KHZ800);
 
-// ================= I2C =====================
-Adafruit_MCP23X17 mcp;
-Adafruit_ADS1115 ads0, ads1;
-Adafruit_VEML7700 veml;
+// ---------------- MOSFET mapping ----------------
+// MCP23017 @ 0x20
+// GPB0..7 = MOSFET_GATE_7..0
+// GPA0..2 = EN_PIEZO_A/B/C
 
-// ================= PWM =====================
-#define PWM_FREQ 40000
-#define PWM_RES 8
-#define PWM_CH_X 0
-#define PWM_CH_Y 1
+// ---------------- Timing ----------------
+unsigned long lastMosfetSwitch = 0;
+unsigned long lastCurrentPrint = 0;
+unsigned long lastLuxPrint = 0;
+unsigned long lastLedStep = 0;
 
-// ================= SONAR ===================
-enum { SONAR_A, SONAR_B, SONAR_C };
-int sonarIndex = 0;
-bool sonarRunning = false;
-unsigned long sonarTimer = 0;
+int mosfetIndex = 0;
+int ledState = 0;
 
-// ================= DSP =====================
-#define FC 40000.0
-#define FS 320000.0
-#define N 128
+// ---------------- Constants ----------------
+const float SHUNT = 0.001f;     // 1 mOhm
+const float ADS_LSB = 0.125e-3; // ADS1115 @ GAIN_ONE = 0.125 mV/bit
 
-float sinLUT[N], cosLUT[N];
-uint16_t adcBuf[N];
-
-// ================= HELP ====================
-void printHelp() {
-  Serial.println(F("\n=== Velion Lightboard Test ==="));
-  Serial.println(F("M n 0/1   -> MOSFET n OFF/ON (0-7)"));
-  Serial.println(F("P A/B/C 0/1 -> Enable piezo channel"));
-  Serial.println(F("I         -> Print all currents"));
-  Serial.println(F("C n       -> Print current n"));
-  Serial.println(F("S START/STOP -> Start/Stop sonar cycle"));
-  Serial.println(F("H 0/1     -> Enable H-bridge"));
-  Serial.println(F("T         -> One sonar test"));
-  Serial.println(F("V         -> Luminosity"));
-}
-
-// ================= SETUP ===================
+// ---------------- Setup ----------------
 void setup() {
   Serial.begin(115200);
-  delay(500);
-
-  Wire.begin(3,4);
-
-  mcp.begin_I2C(0x20);
-  for(int i=8;i<16;i++) mcp.pinMode(i, OUTPUT);
-  for(int i=0;i<3;i++) mcp.pinMode(i, OUTPUT);
-
-  ads0.begin(0x48);
-  ads1.begin(0x49);
-  ads0.setGain(GAIN_SIXTEEN);
-  ads1.setGain(GAIN_SIXTEEN);
-
-  veml.begin();
-
-  ledcSetup(PWM_CH_X, PWM_FREQ, PWM_RES);
-  ledcSetup(PWM_CH_Y, PWM_FREQ, PWM_RES);
-  ledcAttachPin(PIN_PIEZO_X, PWM_CH_X);
-  ledcAttachPin(PIN_PIEZO_Y, PWM_CH_Y);
-
-  for(int i=0;i<N;i++){
-    float a = 2*PI*FC*i/FS;
-    sinLUT[i]=sin(a);
-    cosLUT[i]=cos(a);
+  Serial.println("test");
+  Wire.begin(3, 4); // SDA=3, SCL=4
+  Serial.println("Booted");
+  for (int i = 0; i < 3; i++) {
+    Serial.print("---- I2C scan #");
+    Serial.print(i + 1);
+    Serial.println(" ----");
+    scanI2C();
+    delay(1000);
   }
 
-  printHelp();
-}
-
-// ================= MOSFET ==================
-void setMOS(int n,bool v){
-  int pin = 8 + (7-n);
-  mcp.digitalWrite(pin,v);
-}
-
-// ================= PIEZO ===================
-void enablePiezo(int ch,bool v){
-  mcp.digitalWrite(ch,v);
-}
-
-void hbridge(bool en){
-  if(en){
-    ledcWrite(PWM_CH_X,255);
-    ledcWrite(PWM_CH_Y,0);
-  } else {
-    ledcWrite(PWM_CH_X,0);
-    ledcWrite(PWM_CH_Y,0);
+  // MCP23017
+  if (!mcp.begin_I2C(0x20)) {
+    Serial.println("MCP23017 not found!");
+    while (1);
   }
+
+  for (int i = 0; i < 8; i++) mcp.pinMode(8 + i, OUTPUT); // GPB0..7
+  for (int i = 0; i < 3; i++) mcp.pinMode(i, OUTPUT);     // GPA0..2
+
+  allMosfetsOff();
+
+  // ADS1115
+  /*
+  if (!ads0.begin(0x48)) {
+    Serial.println("ADS1115 (0x48) not found!");
+    while (1);
+  }
+
+  if (!ads1.begin(0x49)) {
+    Serial.println("ADS1115 (0x49) not found!");
+    while (1);
+  }
+
+  ads0.setGain(GAIN_ONE);
+  ads1.setGain(GAIN_ONE);
+*/
+// ---------------- VEML7700 ----------------
+if (!veml.begin()) {
+  Serial.println("VEML7700 not found at 0x10");
+  while (1);
 }
 
-// ================= CURRENT =================
-float readCurrent(int n){
-  int16_t adc;
-  if(n<4) adc=ads0.readADC_SingleEnded(3-n);
-  else adc=ads1.readADC_SingleEnded(7-n);
-  return adc * 0.0078125; // mA
+// Optional: make it explicit
+veml.setGain(VEML7700_GAIN_1);
+veml.setIntegrationTime(VEML7700_IT_100MS);
+
+  // WS2812
+  strip.begin();
+  strip.show();
 }
 
-// ================= DSP =====================
-float detectCarrier(){
-  float I=0,Q=0;
-  for(int i=0;i<N;i++){
-    adcBuf[i]=analogRead(ADC_ECHO);
-    I+=adcBuf[i]*cosLUT[i];
-    Q+=adcBuf[i]*sinLUT[i];
+// ---------------- Helpers ----------------
+
+void scanI2C() {
+  Serial.println("I2C scan start");
+
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+
+    if (err == 0) {
+      Serial.print("  Found device at 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.println(addr, HEX);
+      found++;
+    }
   }
-  return sqrt(I*I+Q*Q);
+
+  if (found == 0) Serial.println("  No I2C devices found");
+  Serial.println("I2C scan end\n");
 }
 
-// ================= SONAR ===================
-void selectSonar(int s){
-  enablePiezo(0,0);
-  enablePiezo(1,0);
-  enablePiezo(2,0);
-  enablePiezo(s,1);
+
+void allMosfetsOff() {
+  for (int i = 0; i < 8; i++) mcp.digitalWrite(8 + i, LOW);
 }
 
-void sonarOnce(){
-  selectSonar(sonarIndex);
-  hbridge(true);
-  delayMicroseconds(200);
-  hbridge(false);
-  delayMicroseconds(100);
-  float amp = detectCarrier();
-  Serial.printf("SONAR %d AMP=%.1f\n",sonarIndex,amp);
-  sonarIndex=(sonarIndex+1)%3;
+void setMosfet(int ch) {
+  allMosfetsOff();
+  // GPB7..0 = MOSFET 0..7
+  int pin = 8 + (7 - ch);
+  mcp.digitalWrite(pin, HIGH);
 }
 
-// ================= SERIAL ==================
-void handleCmd(){
-  if(!Serial.available()) return;
-  String c=Serial.readStringUntil('\n');
-  c.trim();
+float readCurrent(int ch) {
+  int16_t raw;
+  if (ch < 4) raw = ads0.readADC_SingleEnded(ch);
+  else raw = ads1.readADC_SingleEnded(ch - 4);
 
-  if(c=="I"){
-    for(int i=0;i<8;i++)
-      Serial.printf("I%d = %.2f mA\n",i,readCurrent(i));
-  }
-  else if(c.startsWith("M")){
-    int n,v;
-    sscanf(c.c_str(),"M %d %d",&n,&v);
-    setMOS(n,v);
-  }
-  else if(c.startsWith("P")){
-    char ch; int v;
-    sscanf(c.c_str(),"P %c %d",&ch,&v);
-    enablePiezo(ch=='A'?0:ch=='B'?1:2,v);
-  }
-  else if(c.startsWith("C")){
-    int n; sscanf(c.c_str(),"C %d",&n);
-    Serial.printf("I%d = %.2f mA\n",n,readCurrent(n));
-  }
-  else if(c=="S START") sonarRunning=true;
-  else if(c=="S STOP") sonarRunning=false;
-  else if(c.startsWith("H")){
-    int v; sscanf(c.c_str(),"H %d",&v);
-    hbridge(v);
-  }
-  else if(c=="T") sonarOnce();
-  else if(c=="V") Serial.println(veml.readLux());
-  else printHelp();
+  float voltage = raw * ADS_LSB;   // volts
+  return voltage / SHUNT;          // amps
 }
 
-// ================= LOOP ====================
-void loop(){
-  handleCmd();
-  if(sonarRunning && millis()-sonarTimer>1000){
-    sonarTimer=millis();
-    sonarOnce();
+void stepLed() {
+  uint32_t color;
+  if (ledState == 0) color = strip.Color(255, 0, 0);
+  else if (ledState == 1) color = strip.Color(0, 255, 0);
+  else color = strip.Color(0, 0, 255);
+
+  for (int i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, color);
+  strip.show();
+
+  ledState = (ledState + 1) % 3;
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  unsigned long now = millis();
+  bool led = 0;
+  // ---- MOSFET sequencing ----
+  if (now - lastMosfetSwitch >= 1000) {
+    setMosfet(mosfetIndex);
+    Serial.print("MOSFET ");
+    Serial.print(mosfetIndex);
+    Serial.println(" ON");
+
+    mosfetIndex = (mosfetIndex + 1) % 8;
+    lastMosfetSwitch = now;
+  }
+
+  // ---- Current printing ----
+  /*
+  if (now - lastCurrentPrint >= 500) {
+    Serial.print("Currents [A]: ");
+    for (int i = 0; i < 8; i++) {
+      Serial.print(readCurrent(i), 3);
+      if (i < 7) Serial.print(", ");
+    }
+    Serial.println();
+    lastCurrentPrint = now;
+  }
+
+  // ---- Lux printing ----
+  if (now - lastLuxPrint >= 1000) {
+    float lux = veml.readLux();
+    Serial.print("Lux: ");
+    Serial.println(lux);
+    lastLuxPrint = now;
+  }
+*/
+  // ---- LED cycling ----
+  if (now - lastLedStep >= 1000) {
+    stepLed();
+    //digitalWrite(LED_BUILTIN, led);  // turn the LED on (HIGH is the voltage level)
+    led = !led;
+    lastLedStep = now;
+  }
+  if (now - lastLuxPrint >= 1000) {
+    float lux = veml.readLux();
+
+    Serial.print("Ambient light: ");
+    Serial.print(lux, 2);
+    Serial.println(" lx");
+
+    lastLuxPrint = now;
   }
 }
