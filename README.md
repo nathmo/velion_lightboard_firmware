@@ -2,7 +2,7 @@
 This is the firmware that control the main board and control pannel of the vehicle.
 
 # General logic
-Use ESP32-C3 FreeRTOS on Arduino  IDE
+Use ESP32-C3 FreeRTOS on Arduino  IDE (ESP32 core 2.0.18)
 
 there is a mainloop which first read the input, generate event. then iterrate over all state machine and feed them the first event untill all event are consumed. then there the output stage which run the PID step and the output monitoring.
 
@@ -30,6 +30,15 @@ GPIO 8 : WS2812 led strip (PIN_RGBLED_DIN)
 GPIO 9 : digital out PIN_PIEZO_PWM_HALF_X
 GPIO 10 : digital out PIN_PIEZO_PWM_HALF_Y
 
+I have two ADC1115IDGS luminosity sensor on the I2C bus with address 1001000 -> 0x48 and 1001001 -> 0x49.
+on the 0x48, AIN0 = SENSE_3, AIN1 = SENSE_2, AIN2 = SENSE_1,AIN3 = SENSE_0 
+
+on the 0x49, AIN0 = SENSE_7, AIN1 = SENSE_6, AIN2 = SENSE_5,AIN3 = SENSE_4
+
+for both ADC, they are mesuring the current trough a 1 milli Ohm resistor with the voltage difference accross it to GND.
+
+I also have a VEML7700 with address 0x10 luminosity sensor on the I2C bus
+
 I have one MCP23017_SO over I2C whose IO I also want to control like if it was a GPIO of the ESP32.
 
 the one with address 0100000 = 0x20 has : 
@@ -46,14 +55,7 @@ GPA0 : EN_PIEZO_A
 GPA1 : EN_PIEZO_B
 GPA2 : EN_PIEZO_C
 
-I also have two ADC1115IDGS luminosity sensor on the I2C bus with address 1001000 -> 0x48 and 1001001 -> 0x49.
-on the 0x48, AIN0 = SENSE_3, AIN1 = SENSE_2, AIN2 = SENSE_1,AIN3 = SENSE_0 
 
-on the 0x49, AIN0 = SENSE_7, AIN1 = SENSE_6, AIN2 = SENSE_5,AIN3 = SENSE_4
-
-for both ADC, they are mesuring the current trough a 1 milli Ohm resistor with the voltage difference accross it to GND.
-
-I also have a VEML7700 luminosity sensor on the I2C bus
 
 
 # Input event

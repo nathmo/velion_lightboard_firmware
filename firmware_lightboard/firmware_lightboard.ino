@@ -38,6 +38,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println("test");
   Wire.begin(3, 4); // SDA=3, SCL=4
+  Wire.setClock(50000);
   Serial.println("Booted");
   for (int i = 0; i < 3; i++) {
     Serial.print("---- I2C scan #");
@@ -79,9 +80,9 @@ if (!veml.begin()) {
   while (1);
 }
 
-// Optional: make it explicit
-veml.setGain(VEML7700_GAIN_1);
-veml.setIntegrationTime(VEML7700_IT_100MS);
+  // Optional: make it explicit
+  veml.setGain(VEML7700_GAIN_1);
+  veml.setIntegrationTime(VEML7700_IT_100MS);
 
   // WS2812
   strip.begin();
@@ -97,7 +98,7 @@ void scanI2C() {
   for (uint8_t addr = 1; addr < 127; addr++) {
     Wire.beginTransmission(addr);
     uint8_t err = Wire.endTransmission();
-
+    Serial.println(addr);
     if (err == 0) {
       Serial.print("  Found device at 0x");
       if (addr < 16) Serial.print("0");
