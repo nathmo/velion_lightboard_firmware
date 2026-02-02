@@ -55,6 +55,143 @@ GPA0 : EN_PIEZO_A
 GPA1 : EN_PIEZO_B
 GPA2 : EN_PIEZO_C
 
+# CAN codes
+
+
+This catalog defines **standard 11-bit CAN 2.0 IDs (0x000–0x7FF)** for the front (`0x17`) and rear (`0x16`) lightboards.  
+Device addressing is handled by **distinct CAN IDs per board**, so no extra address byte is needed in payloads.
+
+**All data is little-endian. DLC is the exact length used.**
+
+---
+
+# Front Lightboard (`0x17`) — CAN IDs
+
+## Input (Control/Set)
+
+| CAN ID | DLC | Purpose | Payload |
+|--------|-----|---------|---------|
+| `0x120` | 1 | Set all front outputs | **Byte 0:** 8-bit control (see Front Bit Mapping) |
+| `0x121` | 5 | Set current thresholds for alert | **Byte 0:** Channel (0–7)<br>**Bytes 1–2:** Low threshold mA (0 = disable)<br>**Bytes 3–4:** High threshold mA (0 = disable) |
+| Bit | Output |
+|-----|--------|
+| 0 | DRL |
+| 1 | Position Left |
+| 2 | Position Right |
+| 3 | Left Blinker |
+| 4 | Right Blinker |
+| 5 | Low Beam |
+| 6 | High Beam |
+| 7 | Horn |
+
+## Output (Status/Telemetry)
+
+| CAN ID | DLC | Purpose | Payload |
+|--------|-----|---------|---------|
+| `0x131` | 1 | Front output status | **Byte 0:** 8-bit status (same bit mapping as control) |
+| `0x132` | 5 | Report current thresholds | Same payload layout as `0x121` |
+| `0x140`–`0x147` | 2 | Current per channel | **Bytes 0–1:** INT16 current in mA for channel 0–7 (CAN ID = `0x140 + channel`) |
+| `0x150` | 3 | Front proximity | **Byte 0:** Left sensor cm<br>**Byte 1:** Center sensor cm<br>**Byte 2:** Right sensor cm |
+| `0x151` | 2 | Ambient light | **Bytes 0–1:** Fixed-exponent lux (see encoding below) |
+
+---
+
+# Rear Lightboard (`0x16`) — CAN IDs
+
+## Input (Control/Set)
+
+| CAN ID | DLC | Purpose | Payload |
+|--------|-----|---------|---------|
+| `0x220` | 1 | Set all front outputs | **Byte 0:** 8-bit control (see Front Bit Mapping) |
+| `0x221` | 5 | Set current thresholds for alert | **Byte 0:** Channel (0–7)<br>**Bytes 1–2:** Low threshold mA (0 = disable)<br>**Bytes 3–4:** High threshold mA (0 = disable) |
+
+| Bit | Output |
+|-----|--------|
+| 0 | Brake |
+| 1 | Left Blinker |
+| 2 | Right Blinker |
+| 3 | Rear Position |
+| 4 | Fog |
+| 5 | Reverse |
+| 6 | License Plate |
+| 7 | Reserved |
+
+## Output (Status/Telemetry)
+
+| CAN ID | DLC | Purpose | Payload |
+|--------|-----|---------|---------|
+| `0x231` | 1 | Front output status | **Byte 0:** 8-bit status (same bit mapping as control) |
+| `0x232` | 5 | Report current thresholds | Same payload layout as `0x121` |
+| `0x240`–`0x247` | 2 | Current per channel | **Bytes 0–1:** INT16 current in mA for channel 0–7 (CAN ID = `0x240 + channel`) |
+| `0x250` | 3 | Front proximity | **Byte 0:** Left sensor cm<br>**Byte 1:** Center sensor cm<br>**Byte 2:** Right sensor cm |
+| `0x251` | 2 | Ambient light | **Bytes 0–1:** Fixed-exponent lux (see encoding below) |
+
+---
+
+## Proximity Encoding (All Boards)
+- **Byte value 0:** Sensor error / dirty
+- **Byte value 255:** No object in range
+- **Byte value 1–254:** Distance in cm
+
+---
+
+## Ambient Light Encoding (VEML7700 Fixed Exponent, 0.1–120k lux)
+
+**16-bit value:**
+- **Bits 15–12:** Exponent `E` (0–15)
+- **Bits 11–0:** Mantissa `M` (0–4095)
+
+**Lux calculation:**
+```
+lux = M × 2^E × 0.1
+```
+
+---
+
+## Full Packet Examples
+### Example 1 — Front: Turn DRL + Horn ON
+| CAN ID | DLC | Data |
+|--------|-----|------|
+| `0x120` | `1` | `0x81` |
+
+**Explanation:**  
+`0x81 = 1000 0001b` → DRL ON (bit 0) + Horn ON (bit 7).
+
+---
+
+### Example 2 — Front: Report Current for Channel 3 (Left Blinker)
+| CAN ID | DLC | Data |
+|--------|-----|------|
+| `0x143` | `2` | `0x2C` `0x01` |
+
+**Explanation:**  
+`0x012C = 300 mA` on channel 3.
+
+---
+
+### Example 3 — Rear: Proximity Telemetry
+| CAN ID | DLC | Data |
+|--------|-----|------|
+| `0x250` | `3` | `0x32` `0xFF` `0x00` |
+
+**Explanation:**  
+- Left sensor = 50 cm  
+- Center = no object (255)  
+- Right = error/dirty (0)
+
+---
+
+### Example 4 — Front: Ambient Light = ~50,000 lux
+| CAN ID | DLC | Data |
+|--------|-----|------|
+| `0x151` | `2` | `0xD2` `0x04` |
+
+**Explanation:**  
+- Encoded value = `0x04D2`  
+- If `E = 1` and `M = 0x0D2 = 210` → `lux = 210 × 2^1 × 0.1 = 42 lux`  
+- Adjust E/M for exact lux target (example shows decoding form).  
+
+---
 
 
 
