@@ -60,7 +60,7 @@ void setup() {
   allMosfetsOff();
 
   // ADS1115
-  /*
+
   if (!ads0.begin(0x48)) {
     Serial.println("ADS1115 (0x48) not found!");
     while (1);
@@ -73,7 +73,7 @@ void setup() {
 
   ads0.setGain(GAIN_ONE);
   ads1.setGain(GAIN_ONE);
-*/
+
 // ---------------- VEML7700 ----------------
 if (!veml.begin()) {
   Serial.println("VEML7700 not found at 0x10");
