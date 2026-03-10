@@ -1,198 +1,896 @@
+/*
+ * Velion Lightboard Firmware
+ * ESP32-C3 + MCP23017 + ADS1115 x2 + VEML7700 + WS2812 + CAN (TWAI)
+ *
+ * Architecture (same as mainboard):
+ *   1. INPUT  — read CAN RX, ADC current sensors, ambient light, sonar echo
+ *   2. EVENT  — generate discrete events from input state changes
+ *   3. FSM    — step each state machine with current events
+ *   4. OUTPUT — apply FSM states to HW (MOSFETs via MCP23017, CAN TX)
+ *
+ * Compile-time flag IS_FRONT_BOARD selects front vs rear pin/CAN mapping.
+ *
+ * Libraries (install via Arduino Library Manager):
+ *   - Adafruit MCP23X17
+ *   - Adafruit NeoPixel
+ *   - Adafruit ADS1X15
+ *   - Adafruit VEML7700
+ *   - ESP32 board package v2.0.18 (includes driver/twai.h)
+ */
+
 #include <Wire.h>
 #include <Adafruit_MCP23X17.h>
+#include <Adafruit_NeoPixel.h>
 #include <Adafruit_ADS1X15.h>
 #include <Adafruit_VEML7700.h>
-#include <Adafruit_NeoPixel.h>
+#include "driver/twai.h"
 
-// ---------------- I2C devices ----------------
-Adafruit_MCP23X17 mcp;     // 0x20
-Adafruit_ADS1115 ads0;    // 0x48
-Adafruit_ADS1115 ads1;    // 0x49
-Adafruit_VEML7700 veml;   // 0x10 default
+// ═══════════════════════════════════════════════════════════════════
+//  BOARD SELECTION — set to true for front, false for rear
+// ═══════════════════════════════════════════════════════════════════
+#define IS_FRONT_BOARD  true
 
-// ---------------- WS2812 ----------------
-#define PIN_RGBLED_DIN 8
-#define LED_COUNT 5
-Adafruit_NeoPixel strip(LED_COUNT, PIN_RGBLED_DIN, NEO_GRB + NEO_KHZ800);
+// ═══════════════════════════════════════════════════════════════════
+//  PIN DEFINITIONS (ESP32-C3)
+// ═══════════════════════════════════════════════════════════════════
+#define PIN_SONAR_ECHO_A      0
+#define PIN_SONAR_ECHO_B      1
+#define PIN_SONAR_ECHO_C      2
+#define PIN_SDA               3
+#define PIN_SCL               4
+#define PIN_CAN_TX            GPIO_NUM_5
+#define PIN_CAN_RX            GPIO_NUM_6
+#define PIN_CAN_S             7     // TJA1051T-3 standby control
+#define PIN_RGBLED_DIN        8
+#define PIN_PIEZO_PWM_HALF_X  9
+#define PIN_PIEZO_PWM_HALF_Y  10
 
-// ---------------- MOSFET mapping ----------------
-// MCP23017 @ 0x20
-// GPB0..7 = MOSFET_GATE_7..0
-// GPA0..2 = EN_PIEZO_A/B/C
+// ═══════════════════════════════════════════════════════════════════
+//  MCP23017 (0x20) PIN ALIASES
+//  GPA0-GPA7 = 0-7,   GPB0-GPB7 = 8-15
+// ═══════════════════════════════════════════════════════════════════
+// GPB — MOSFET gates (active HIGH)
+#define MCP_MOSFET_GATE_7   8   // GPB0
+#define MCP_MOSFET_GATE_6   9   // GPB1
+#define MCP_MOSFET_GATE_5  10   // GPB2
+#define MCP_MOSFET_GATE_4  11   // GPB3
+#define MCP_MOSFET_GATE_3  12   // GPB4
+#define MCP_MOSFET_GATE_2  13   // GPB5
+#define MCP_MOSFET_GATE_1  14   // GPB6
+#define MCP_MOSFET_GATE_0  15   // GPB7
 
-// ---------------- Timing ----------------
-unsigned long lastMosfetSwitch = 0;
-unsigned long lastCurrentPrint = 0;
-unsigned long lastLuxPrint = 0;
-unsigned long lastLedStep = 0;
+// GPA — Piezo half-H bridge enables
+#define MCP_EN_PIEZO_A_X    0   // GPA0
+#define MCP_EN_PIEZO_B_X    1   // GPA1
+#define MCP_EN_PIEZO_C_X    2   // GPA2
+#define MCP_EN_PIEZO_A_Y    3   // GPA3
+#define MCP_EN_PIEZO_B_Y    4   // GPA4
+#define MCP_EN_PIEZO_C_Y    5   // GPA5
 
-int mosfetIndex = 0;
-int ledState = 0;
+// ═══════════════════════════════════════════════════════════════════
+//  CAN CONTROL BIT MAPPING (from 0x400, 2-byte LE)
+// ═══════════════════════════════════════════════════════════════════
+#define BIT_HORN         0   // frontboard only
+#define BIT_BRAKE        1   // rearboard only
+#define BIT_TAIL         2   // rearboard only
+#define BIT_RIGHT_BLINK  3
+#define BIT_LEFT_BLINK   4
+#define BIT_HIGH_BEAM    5   // frontboard only — edge-driven smart light
+#define BIT_LOW_BEAM     6   // frontboard only — edge-driven smart light
+#define BIT_DRL          7   // frontboard only
+#define BIT_FLASH        8   // rearboard only
+#define BIT_FOG          9   // rearboard only
+#define BIT_REVERSE     10   // rearboard only
 
-// ---------------- Constants ----------------
-const float SHUNT = 0.001f;     // 1 mOhm
-const float ADS_LSB = 0.125e-3; // ADS1115 @ GAIN_ONE = 0.125 mV/bit
+// ═══════════════════════════════════════════════════════════════════
+//  CAN IDs
+// ═══════════════════════════════════════════════════════════════════
+#define CAN_ID_LIGHT_CONTROL    0x400
+#define CAN_ID_SET_THRESHOLD    0x121
 
-// ---------------- Setup ----------------
+// Output CAN base IDs (rear / front)
+#if IS_FRONT_BOARD
+  #define CAN_BASE_OUT  0x491
+#else
+  #define CAN_BASE_OUT  0x481
+#endif
+
+#define CAN_ID_MOSFET_STATUS    (CAN_BASE_OUT + 0)   // 0x491/0x481
+#define CAN_ID_THRESHOLD_RPT    (CAN_BASE_OUT + 1)   // 0x492/0x482
+#define CAN_ID_CURRENT_CH0      (CAN_BASE_OUT + 2)   // +2..+9 for ch 0-7
+#define CAN_ID_PROXIMITY        (CAN_BASE_OUT + 10)   // 0x49B/0x48B
+#define CAN_ID_AMBIENT          (CAN_BASE_OUT + 11)   // 0x49C/0x48C
+
+// ═══════════════════════════════════════════════════════════════════
+//  MOSFET GATE LOOKUP — maps control bit index → MCP pin
+//  -1 = not applicable on this board variant
+// ═══════════════════════════════════════════════════════════════════
+#if IS_FRONT_BOARD
+  // Bit: 0=horn→G4, 1=N/A, 2=N/A, 3=Rblink→G3, 4=Lblink→G2,
+  //      5=HiBeam→G1(smart), 6=LowBeam→G1(smart), 7=DRL→G0
+  static const int8_t bitToMosfetPin[11] = {
+    MCP_MOSFET_GATE_4,  // 0  horn
+    -1,                  // 1  brake (rear only)
+    -1,                  // 2  tail  (rear only)
+    MCP_MOSFET_GATE_3,  // 3  right blinker
+    MCP_MOSFET_GATE_2,  // 4  left blinker
+    -1,                  // 5  high beam (handled by smart light FSM)
+    -1,                  // 6  low beam  (handled by smart light FSM)
+    MCP_MOSFET_GATE_0,  // 7  DRL
+    -1,                  // 8  flash (rear only)
+    -1,                  // 9  fog   (rear only)
+    -1                   // 10 reverse (rear only)
+  };
+#else
+  // Rear: 0=N/A, 1=brake→G1, 2=tail→G0, 3=Rblink→G3, 4=Lblink→G2,
+  //       5=N/A, 6=N/A, 7=N/A, 8=flash→G7, 9=fog→G6, 10=reverse→G5
+  static const int8_t bitToMosfetPin[11] = {
+    -1,                  // 0  horn (front only)
+    MCP_MOSFET_GATE_1,  // 1  brake
+    MCP_MOSFET_GATE_0,  // 2  tail
+    MCP_MOSFET_GATE_3,  // 3  right blinker
+    MCP_MOSFET_GATE_2,  // 4  left blinker
+    -1,                  // 5  high beam (front only)
+    -1,                  // 6  low beam  (front only)
+    -1,                  // 7  DRL (front only)
+    MCP_MOSFET_GATE_7,  // 8  flash
+    MCP_MOSFET_GATE_6,  // 9  fog
+    MCP_MOSFET_GATE_5   // 10 reverse
+  };
+#endif
+
+// ═══════════════════════════════════════════════════════════════════
+//  SMART LIGHT FSM (front board only) — DRL / Low / High beam
+//  The physical lamp has an edge-triggered controller:
+//    BOOT → DRL only
+//    rising edge → Low Beam
+//    rising edge → High Beam
+//    rising edge → Low Beam  (cycles between low/high)
+//
+//  We track the lamp's internal state and send edges on MOSFET_GATE_1
+//  to navigate to the desired CAN-commanded state.
+//  Max 1 edge per second.
+// ═══════════════════════════════════════════════════════════════════
+enum SmartLightState : uint8_t {
+  SL_DRL = 0,
+  SL_LOW_BEAM,
+  SL_HIGH_BEAM
+};
+
+SmartLightState slCurrent  = SL_DRL;    // what the lamp is currently in
+SmartLightState slDesired  = SL_DRL;    // what CAN commands want
+bool     slEdgeActive      = false;     // currently pulsing the MOSFET
+uint32_t slLastEdgeMs      = 0;         // time of last rising edge
+#define  SL_EDGE_MIN_MS    1000         // min 1 s between edges
+#define  SL_PULSE_MS       80           // pulse width for edge
+
+// ═══════════════════════════════════════════════════════════════════
+//  PERIPHERAL OBJECTS
+// ═══════════════════════════════════════════════════════════════════
+Adafruit_MCP23X17 mcp;
+Adafruit_ADS1115  ads0;  // 0x48 — SENSE_0..3
+Adafruit_ADS1115  ads1;  // 0x49 — SENSE_4..7
+Adafruit_VEML7700 veml;
+
+bool mcp_ok  = false;
+bool ads0_ok = false;
+bool ads1_ok = false;
+bool veml_ok = false;
+
+// ═══════════════════════════════════════════════════════════════════
+//  NeoPixel
+// ═══════════════════════════════════════════════════════════════════
+#define NUM_PIXELS 1
+Adafruit_NeoPixel pixels(NUM_PIXELS, PIN_RGBLED_DIN, NEO_GRB + NEO_KHZ800);
+
+// ═══════════════════════════════════════════════════════════════════
+//  SOFTWARE TIMERS
+// ═══════════════════════════════════════════════════════════════════
+struct SoftTimer {
+  bool     running;
+  uint32_t startMs;
+  uint32_t durationMs;
+};
+
+void timerStart(SoftTimer &t, uint32_t ms) {
+  t.running    = true;
+  t.startMs    = millis();
+  t.durationMs = ms;
+}
+
+void timerStop(SoftTimer &t) { t.running = false; }
+
+bool timerExpired(SoftTimer &t) {
+  if (!t.running) return false;
+  if (millis() - t.startMs >= t.durationMs) {
+    t.running = false;
+    return true;
+  }
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CAN COMMAND WATCHDOG — 3 s timeout
+// ═══════════════════════════════════════════════════════════════════
+uint32_t lastCanCmdMs      = 0;
+bool     canCmdValid       = false;
+uint16_t canCmdBits        = 0;       // last received 11-bit control word
+uint16_t canCmdBitsPrev    = 0;       // previous cycle (for edge detection)
+#define  CAN_CMD_TIMEOUT_MS 3000
+
+// ═══════════════════════════════════════════════════════════════════
+//  CURRENT SENSE (ADS1115)
+//  Each ADC channel measures voltage across a 1 mΩ shunt to GND.
+//  ADS1115 in single-ended mode gives voltage in mV;
+//  I = V / R = V_uV / 1000  → mA  (since R = 0.001 Ω, I_mA = V_mV)
+//  At gain=16 (±0.256V), LSB = 0.0078125 mV → resolution ~7.8 µA
+// ═══════════════════════════════════════════════════════════════════
+int16_t  currentMa[8]          = {0};    // latest current in mA per channel
+int16_t  thresholdLowMa[8]     = {0};    // 0 = disabled
+int16_t  thresholdHighMa[8]    = {0};    // 0 = disabled
+bool     currentAlert[8]       = {false};
+
+// ADS1115 channel order:  ads0: AIN0=SENSE_3, AIN1=SENSE_2, AIN2=SENSE_1, AIN3=SENSE_0
+//                         ads1: AIN0=SENSE_7, AIN1=SENSE_6, AIN2=SENSE_5, AIN3=SENSE_4
+// Map sense index (0-7) → {ads pointer, ads channel}
+struct AdsChanMap {
+  Adafruit_ADS1115* ads;
+  uint8_t           chan;
+  bool*             ok;
+};
+
+AdsChanMap adsChanMap[8]; // filled in setup
+
+// Timing for round-robin ADC reading
+uint8_t  adsNextChan     = 0;
+uint32_t lastAdsReadMs   = 0;
+#define  ADS_READ_INTERVAL_MS 2   // ~2 ms per channel → all 8 in ~16 ms
+
+// ═══════════════════════════════════════════════════════════════════
+//  AMBIENT LIGHT (VEML7700)
+// ═══════════════════════════════════════════════════════════════════
+float    ambientLux      = 0.0f;
+uint32_t lastVemlReadMs  = 0;
+#define  VEML_READ_INTERVAL_MS 200
+
+// ═══════════════════════════════════════════════════════════════════
+//  SONAR — Piezo ultrasonic (40 kHz Goertzel)
+//  HARDWARE BUG: excitation disabled. Code present but commented out.
+// ═══════════════════════════════════════════════════════════════════
+#define SONAR_CHANNELS      3
+#define SONAR_SAMPLE_RATE   80000   // 80 kHz sampling (2x Nyquist for 40 kHz)
+#define SONAR_TARGET_FREQ   40000   // 40 kHz
+#define SONAR_BLOCK_SIZE    64      // samples per Goertzel block
+#define SONAR_EXCITE_CYCLES 8       // number of 40 kHz cycles to transmit
+#define SONAR_MAX_RANGE_CM  254
+#define SONAR_SPEED_OF_SOUND_CM_US 0.0343f  // cm per µs
+
+// Goertzel coefficient for 40 kHz at 80 kHz sample rate
+// k = round(N * f_target / f_sample) = round(64 * 40000 / 80000) = 32
+// coeff = 2*cos(2*PI*k/N) = 2*cos(2*PI*32/64) = 2*cos(PI) = -2.0
+static const float GOERTZEL_COEFF = -2.0f;
+
+enum SonarState : uint8_t {
+  SONAR_IDLE,
+  SONAR_EXCITING,
+  SONAR_LISTENING,
+  SONAR_DONE
+};
+
+struct SonarChannel {
+  uint8_t     echoPin;
+  uint8_t     enPinX;
+  uint8_t     enPinY;
+  SonarState  state;
+  uint32_t    exciteStartUs;
+  uint32_t    listenStartUs;
+  uint8_t     distanceCm;     // 0=error, 255=no object, 1-254=cm
+  float       goertzelQ0;
+  float       goertzelQ1;
+  float       goertzelQ2;
+  uint16_t    sampleCount;
+  bool        echoDetected;
+  uint32_t    echoTimeUs;
+};
+
+SonarChannel sonar[SONAR_CHANNELS];
+uint8_t      sonarActiveCh = 0;
+uint32_t     lastSonarCycleMs = 0;
+#define      SONAR_CYCLE_MS   50
+
+void sonarInit() {
+  sonar[0] = { PIN_SONAR_ECHO_A, MCP_EN_PIEZO_A_X, MCP_EN_PIEZO_A_Y,
+               SONAR_IDLE, 0, 0, 255, 0, 0, 0, 0, false, 0 };
+  sonar[1] = { PIN_SONAR_ECHO_B, MCP_EN_PIEZO_B_X, MCP_EN_PIEZO_B_Y,
+               SONAR_IDLE, 0, 0, 255, 0, 0, 0, 0, false, 0 };
+  sonar[2] = { PIN_SONAR_ECHO_C, MCP_EN_PIEZO_C_X, MCP_EN_PIEZO_C_Y,
+               SONAR_IDLE, 0, 0, 255, 0, 0, 0, 0, false, 0 };
+}
+
+// Start excitation for a sonar channel  (DISABLED — HW bug)
+void sonarStartExcite(uint8_t ch) {
+  if (!mcp_ok) return;
+  SonarChannel &s = sonar[ch];
+
+  // Enable both half-H bridges
+  // *** DISABLED: HW bug — cannot independently control X/Y per channel ***
+  // mcp.digitalWrite(s.enPinX, HIGH);
+  // mcp.digitalWrite(s.enPinY, HIGH);
+
+  s.state = SONAR_EXCITING;
+  s.exciteStartUs = micros();
+  s.echoDetected = false;
+  s.goertzelQ0 = 0;
+  s.goertzelQ1 = 0;
+  s.goertzelQ2 = 0;
+  s.sampleCount = 0;
+
+  // Start 40 kHz PWM on both half-bridge pins (complementary)
+  // *** DISABLED: HW bug ***
+  // ledcSetup(0, SONAR_TARGET_FREQ, 1);  // 1-bit resolution → 50% duty
+  // ledcAttachPin(PIN_PIEZO_PWM_HALF_X, 0);
+  // ledcSetup(1, SONAR_TARGET_FREQ, 1);
+  // ledcAttachPin(PIN_PIEZO_PWM_HALF_Y, 1);
+  // ledcWrite(0, 1);
+  // ledcWrite(1, 0);  // complementary
+}
+
+// Stop excitation, switch to listening mode  (DISABLED — HW bug)
+void sonarStartListen(uint8_t ch) {
+  SonarChannel &s = sonar[ch];
+
+  // Stop PWM
+  // *** DISABLED: HW bug ***
+  // ledcDetachPin(PIN_PIEZO_PWM_HALF_X);
+  // ledcDetachPin(PIN_PIEZO_PWM_HALF_Y);
+  // digitalWrite(PIN_PIEZO_PWM_HALF_X, LOW);
+  // digitalWrite(PIN_PIEZO_PWM_HALF_Y, LOW);
+
+  // Disable half-H bridges → High-Z for listening
+  // *** DISABLED: HW bug ***
+  // if (mcp_ok) {
+  //   mcp.digitalWrite(s.enPinX, LOW);
+  //   mcp.digitalWrite(s.enPinY, LOW);
+  // }
+
+  s.state = SONAR_LISTENING;
+  s.listenStartUs = micros();
+  s.goertzelQ0 = 0;
+  s.goertzelQ1 = 0;
+  s.goertzelQ2 = 0;
+  s.sampleCount = 0;
+}
+
+// Goertzel filter: feed one sample, check for echo threshold
+// Returns magnitude² of 40 kHz component when block is complete
+float sonarGoertzelProcess(SonarChannel &s, float sample) {
+  s.goertzelQ0 = GOERTZEL_COEFF * s.goertzelQ1 - s.goertzelQ2 + sample;
+  s.goertzelQ2 = s.goertzelQ1;
+  s.goertzelQ1 = s.goertzelQ0;
+  s.sampleCount++;
+
+  if (s.sampleCount >= SONAR_BLOCK_SIZE) {
+    // Compute magnitude² = q1² + q2² - coeff*q1*q2
+    float mag2 = s.goertzelQ1 * s.goertzelQ1
+               + s.goertzelQ2 * s.goertzelQ2
+               - GOERTZEL_COEFF * s.goertzelQ1 * s.goertzelQ2;
+    // Reset for next block
+    s.goertzelQ0 = 0;
+    s.goertzelQ1 = 0;
+    s.goertzelQ2 = 0;
+    s.sampleCount = 0;
+    return mag2;
+  }
+  return -1.0f;  // block not complete yet
+}
+
+// Sonar state machine step (called from main loop)  — ALL DISABLED
+void sonarStep() {
+  // *** ENTIRE SONAR EXCITATION AND LISTENING DISABLED DUE TO HW BUG ***
+  // The code below shows the intended logic for reference.
+
+  /*
+  uint32_t nowUs = micros();
+  uint32_t nowMs = millis();
+
+  // Round-robin: start a new measurement every SONAR_CYCLE_MS
+  if (sonar[sonarActiveCh].state == SONAR_IDLE) {
+    if (nowMs - lastSonarCycleMs >= SONAR_CYCLE_MS) {
+      lastSonarCycleMs = nowMs;
+      sonarStartExcite(sonarActiveCh);
+    }
+  }
+
+  SonarChannel &s = sonar[sonarActiveCh];
+
+  switch (s.state) {
+    case SONAR_EXCITING: {
+      // Excite for SONAR_EXCITE_CYCLES at 40 kHz = 200 µs
+      uint32_t exciteDurationUs = (SONAR_EXCITE_CYCLES * 1000000UL) / SONAR_TARGET_FREQ;
+      if (nowUs - s.exciteStartUs >= exciteDurationUs) {
+        sonarStartListen(sonarActiveCh);
+      }
+      break;
+    }
+
+    case SONAR_LISTENING: {
+      // Read analog sample from echo pin
+      float sample = (float)analogRead(s.echoPin);
+
+      // Feed to Goertzel filter
+      float mag2 = sonarGoertzelProcess(s, sample);
+      if (mag2 >= 0.0f) {
+        // Block complete — check threshold (tuned empirically)
+        const float ECHO_THRESHOLD = 50000.0f;
+        if (mag2 > ECHO_THRESHOLD && !s.echoDetected) {
+          s.echoDetected = true;
+          s.echoTimeUs = nowUs - s.listenStartUs;
+        }
+      }
+
+      // Timeout: max range ~4m → ~23 ms round-trip
+      if (nowUs - s.listenStartUs > 25000) {
+        if (s.echoDetected) {
+          float distCm = (s.echoTimeUs * SONAR_SPEED_OF_SOUND_CM_US) / 2.0f;
+          if (distCm < 1.0f) distCm = 1.0f;
+          if (distCm > SONAR_MAX_RANGE_CM) {
+            s.distanceCm = 255;
+          } else {
+            s.distanceCm = (uint8_t)distCm;
+          }
+        } else {
+          s.distanceCm = 255;  // no echo → no object
+        }
+        s.state = SONAR_DONE;
+      }
+      break;
+    }
+
+    case SONAR_DONE:
+      s.state = SONAR_IDLE;
+      sonarActiveCh = (sonarActiveCh + 1) % SONAR_CHANNELS;
+      break;
+
+    case SONAR_IDLE:
+      break;
+  }
+  */
+
+  // With sonar disabled, report 0 (sensor error) for all channels
+  for (int i = 0; i < SONAR_CHANNELS; i++) {
+    sonar[i].distanceCm = 0;  // 0 = sensor error / disabled
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CURRENT SENSING — round-robin ADS1115 reads
+// ═══════════════════════════════════════════════════════════════════
+void readCurrentSensors() {
+  uint32_t now = millis();
+  if (now - lastAdsReadMs < ADS_READ_INTERVAL_MS) return;
+  lastAdsReadMs = now;
+
+  AdsChanMap &m = adsChanMap[adsNextChan];
+  if (m.ads != NULL && *(m.ok)) {
+    // ADS1115 at gain 16 (±0.256V), LSB = 0.0078125 mV
+    // Voltage across 1 mΩ shunt: V = LSB * raw  (in mV)
+    // Current: I = V / R → with 1 mΩ, I_mA = V_mV
+    int16_t raw = m.ads->readADC_SingleEnded(m.chan);
+    float voltageMv = raw * 0.0078125f;
+    currentMa[adsNextChan] = (int16_t)voltageMv;
+  }
+
+  // Check thresholds
+  for (int i = 0; i < 8; i++) {
+    currentAlert[i] = false;
+    if (thresholdLowMa[i] > 0 && currentMa[i] < thresholdLowMa[i]) {
+      currentAlert[i] = true;
+    }
+    if (thresholdHighMa[i] > 0 && currentMa[i] > thresholdHighMa[i]) {
+      currentAlert[i] = true;
+    }
+  }
+
+  adsNextChan = (adsNextChan + 1) % 8;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AMBIENT LIGHT — VEML7700
+// ═══════════════════════════════════════════════════════════════════
+void readAmbientLight() {
+  if (!veml_ok) return;
+  uint32_t now = millis();
+  if (now - lastVemlReadMs < VEML_READ_INTERVAL_MS) return;
+  lastVemlReadMs = now;
+
+  float lux = veml.readLux();
+  ambientLux = (isnan(lux) || isinf(lux) || lux < 0.0f) ? 0.0f : lux;
+}
+
+// Encode lux → 16-bit fixed-exponent format
+// lux = M × 2^E × 0.1    →   M = lux / (2^E × 0.1)
+uint16_t encodeLux(float lux) {
+  if (lux < 0.0f) lux = 0.0f;
+  for (uint8_t e = 0; e < 16; e++) {
+    float scale = 0.1f * (float)(1 << e);
+    float m = lux / scale;
+    if (m <= 4095.0f) {
+      uint16_t mInt = (uint16_t)m;
+      return ((uint16_t)e << 12) | (mInt & 0x0FFF);
+    }
+  }
+  return 0xFFFF;  // overflow
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CAN RX — read all pending messages
+// ═══════════════════════════════════════════════════════════════════
+void readCAN() {
+  twai_message_t msg;
+  while (twai_receive(&msg, 0) == ESP_OK) {
+    switch (msg.identifier) {
+      case CAN_ID_LIGHT_CONTROL: {
+        if (msg.data_length_code >= 2) {
+          canCmdBitsPrev = canCmdBits;
+          canCmdBits = (uint16_t)(msg.data[0] | (msg.data[1] << 8));
+          lastCanCmdMs = millis();
+          canCmdValid = true;
+        }
+        break;
+      }
+      case CAN_ID_SET_THRESHOLD: {
+        if (msg.data_length_code >= 5) {
+          uint8_t ch = msg.data[0];
+          if (ch < 8) {
+            thresholdLowMa[ch]  = (int16_t)(msg.data[1] | (msg.data[2] << 8));
+            thresholdHighMa[ch] = (int16_t)(msg.data[3] | (msg.data[4] << 8));
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CAN TX — periodic telemetry broadcast
+// ═══════════════════════════════════════════════════════════════════
+uint32_t lastCanTxMs    = 0;
+#define  CAN_TX_INTERVAL_MS 100
+
+// Current channel broadcast round-robin
+uint8_t  canTxCurrChan  = 0;
+uint32_t lastCanCurrMs  = 0;
+#define  CAN_CURR_INTERVAL_MS 50  // one channel every 50 ms → all 8 in 400 ms
+
+void sendCanTelemetry() {
+  uint32_t now = millis();
+
+  // ── Mosfet status + proximity + ambient @ 10 Hz ──
+  if (now - lastCanTxMs >= CAN_TX_INTERVAL_MS) {
+    lastCanTxMs = now;
+    twai_message_t msg;
+    msg.flags = 0;
+
+    // MOSFET status (1 byte)
+    msg.identifier       = CAN_ID_MOSFET_STATUS;
+    msg.data_length_code = 1;
+    msg.data[0] = (uint8_t)(canCmdBits & 0xFF);
+    twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+    // Proximity (3 bytes)
+    msg.identifier       = CAN_ID_PROXIMITY;
+    msg.data_length_code = 3;
+    msg.data[0] = sonar[0].distanceCm;
+    msg.data[1] = sonar[1].distanceCm;
+    msg.data[2] = sonar[2].distanceCm;
+    twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+    // Ambient light (2 bytes)
+    msg.identifier       = CAN_ID_AMBIENT;
+    msg.data_length_code = 2;
+    uint16_t luxEnc = encodeLux(ambientLux);
+    msg.data[0] = (uint8_t)(luxEnc & 0xFF);
+    msg.data[1] = (uint8_t)((luxEnc >> 8) & 0xFF);
+    twai_transmit(&msg, pdMS_TO_TICKS(5));
+  }
+
+  // ── Current per channel @ 20 Hz round-robin ──
+  if (now - lastCanCurrMs >= CAN_CURR_INTERVAL_MS) {
+    lastCanCurrMs = now;
+    twai_message_t msg;
+    msg.flags            = 0;
+    msg.identifier       = CAN_ID_CURRENT_CH0 + canTxCurrChan;
+    msg.data_length_code = 2;
+    msg.data[0] = (uint8_t)(currentMa[canTxCurrChan] & 0xFF);
+    msg.data[1] = (uint8_t)((currentMa[canTxCurrChan] >> 8) & 0xFF);
+    twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+    canTxCurrChan = (canTxCurrChan + 1) % 8;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SMART LIGHT FSM — front board only
+//  Determines desired state from CAN bits, then pulses MOSFET_GATE_1
+//  to cycle the physical lamp's edge-triggered controller.
+// ═══════════════════════════════════════════════════════════════════
+#if IS_FRONT_BOARD
+
+void smartLightStep() {
+  uint32_t now = millis();
+
+  // Determine desired state from CAN command bits
+  bool wantHigh = (canCmdValid && (canCmdBits & (1 << BIT_HIGH_BEAM)));
+  bool wantLow  = (canCmdValid && (canCmdBits & (1 << BIT_LOW_BEAM)));
+
+  if (wantHigh) {
+    slDesired = SL_HIGH_BEAM;
+  } else if (wantLow) {
+    slDesired = SL_LOW_BEAM;
+  } else {
+    slDesired = SL_DRL;
+  }
+
+  // If edge pulse is active, check if it's time to end it
+  if (slEdgeActive) {
+    if (now - slLastEdgeMs >= SL_PULSE_MS) {
+      // End pulse — drop MOSFET
+      if (mcp_ok) mcp.digitalWrite(MCP_MOSFET_GATE_1, LOW);
+      slEdgeActive = false;
+
+      // Advance lamp state (the lamp saw a rising edge)
+      switch (slCurrent) {
+        case SL_DRL:       slCurrent = SL_LOW_BEAM;  break;
+        case SL_LOW_BEAM:  slCurrent = SL_HIGH_BEAM; break;
+        case SL_HIGH_BEAM: slCurrent = SL_LOW_BEAM;  break;
+      }
+    }
+    return;  // don't start another edge while one is active
+  }
+
+  // Already in desired state — nothing to do
+  if (slCurrent == slDesired) return;
+
+  // Rate limit: min 1 s between edges
+  if (now - slLastEdgeMs < SL_EDGE_MIN_MS) return;
+
+  // Can't return to DRL via edges (lamp doesn't support it)
+  if (slDesired == SL_DRL) return;
+
+  // Need an edge: activate pulse
+  slEdgeActive = true;
+  slLastEdgeMs = now;
+  if (mcp_ok) mcp.digitalWrite(MCP_MOSFET_GATE_1, HIGH);
+}
+
+#endif // IS_FRONT_BOARD
+
+// ═══════════════════════════════════════════════════════════════════
+//  OUTPUT STAGE — apply CAN command bits to MOSFET gates
+// ═══════════════════════════════════════════════════════════════════
+void applyOutputs() {
+  if (!mcp_ok) return;
+
+  uint32_t now = millis();
+
+  // Watchdog: if no CAN command for 3 s, turn everything off
+  if (canCmdValid && (now - lastCanCmdMs >= CAN_CMD_TIMEOUT_MS)) {
+    canCmdValid = false;
+    canCmdBits = 0;
+    canCmdBitsPrev = 0;
+#if IS_FRONT_BOARD
+    mcp.digitalWrite(MCP_MOSFET_GATE_1, LOW);
+    slEdgeActive = false;
+#endif
+  }
+
+  uint16_t bits = canCmdValid ? canCmdBits : 0;
+
+  // Apply each bit to its mapped MOSFET (except smart-light bits on front)
+  for (int b = 0; b < 11; b++) {
+#if IS_FRONT_BOARD
+    if (b == BIT_HIGH_BEAM || b == BIT_LOW_BEAM) continue;
+#endif
+    int8_t pin = bitToMosfetPin[b];
+    if (pin < 0) continue;
+    bool on = (bits >> b) & 1;
+    mcp.digitalWrite(pin, on ? HIGH : LOW);
+  }
+
+#if IS_FRONT_BOARD
+  smartLightStep();
+#endif
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SETUP HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+void setupCAN() {
+  twai_general_config_t g_config =
+    TWAI_GENERAL_CONFIG_DEFAULT(PIN_CAN_TX, PIN_CAN_RX, TWAI_MODE_NORMAL);
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
+    Serial.println("[CAN] Driver installed");
+  } else {
+    Serial.println("[CAN] Driver install FAILED");
+  }
+  if (twai_start() == ESP_OK) {
+    Serial.println("[CAN] Started @ 1 Mbps");
+  } else {
+    Serial.println("[CAN] Start FAILED");
+  }
+}
+
+void setupMCP() {
+  if (mcp.begin_I2C(0x20)) {
+    mcp_ok = true;
+    Serial.println("[MCP] 0x20 OK");
+
+    // GPB: all MOSFET gates → output, initially LOW
+    for (int p = 8; p <= 15; p++) {
+      mcp.pinMode(p, OUTPUT);
+      mcp.digitalWrite(p, LOW);
+    }
+
+    // GPA: piezo enables → output, initially LOW (High-Z = disabled)
+    for (int p = 0; p <= 5; p++) {
+      mcp.pinMode(p, OUTPUT);
+      mcp.digitalWrite(p, LOW);
+    }
+  } else {
+    Serial.println("[MCP] 0x20 NOT FOUND");
+  }
+}
+
+void setupADS() {
+  if (ads0.begin(0x48)) {
+    ads0_ok = true;
+    ads0.setGain(GAIN_SIXTEEN);  // ±0.256V
+    ads0.setDataRate(RATE_ADS1115_860SPS);
+    Serial.println("[ADS] 0x48 OK");
+  } else {
+    Serial.println("[ADS] 0x48 NOT FOUND");
+  }
+
+  if (ads1.begin(0x49)) {
+    ads1_ok = true;
+    ads1.setGain(GAIN_SIXTEEN);
+    ads1.setDataRate(RATE_ADS1115_860SPS);
+    Serial.println("[ADS] 0x49 OK");
+  } else {
+    Serial.println("[ADS] 0x49 NOT FOUND");
+  }
+
+  // Build channel map:
+  // ads0: AIN0=SENSE_3, AIN1=SENSE_2, AIN2=SENSE_1, AIN3=SENSE_0
+  adsChanMap[0] = { &ads0, 3, &ads0_ok };
+  adsChanMap[1] = { &ads0, 2, &ads0_ok };
+  adsChanMap[2] = { &ads0, 1, &ads0_ok };
+  adsChanMap[3] = { &ads0, 0, &ads0_ok };
+
+  // ads1: AIN0=SENSE_7, AIN1=SENSE_6, AIN2=SENSE_5, AIN3=SENSE_4
+  adsChanMap[4] = { &ads1, 3, &ads1_ok };
+  adsChanMap[5] = { &ads1, 2, &ads1_ok };
+  adsChanMap[6] = { &ads1, 1, &ads1_ok };
+  adsChanMap[7] = { &ads1, 0, &ads1_ok };
+}
+
+void setupVEML() {
+  if (veml.begin()) {
+    veml_ok = true;
+    veml.setGain(VEML7700_GAIN_1);
+    veml.setIntegrationTime(VEML7700_IT_100MS);
+    Serial.println("[VEML] 0x10 OK");
+  } else {
+    Serial.println("[VEML] 0x10 NOT FOUND");
+  }
+}
+
+void setupGPIO() {
+  // CAN standby pin — drive LOW for normal operation
+  pinMode(PIN_CAN_S, OUTPUT);
+  digitalWrite(PIN_CAN_S, LOW);
+
+  // Sonar echo analog inputs
+  pinMode(PIN_SONAR_ECHO_A, INPUT);
+  pinMode(PIN_SONAR_ECHO_B, INPUT);
+  pinMode(PIN_SONAR_ECHO_C, INPUT);
+
+  // Piezo PWM pins — LOW (disabled)
+  pinMode(PIN_PIEZO_PWM_HALF_X, OUTPUT);
+  digitalWrite(PIN_PIEZO_PWM_HALF_X, LOW);
+  pinMode(PIN_PIEZO_PWM_HALF_Y, OUTPUT);
+  digitalWrite(PIN_PIEZO_PWM_HALF_Y, LOW);
+}
+
+void setupNeoPixel() {
+  pixels.begin();
+  pixels.setBrightness(30);
+  pixels.setPixelColor(0, pixels.Color(0, 0, 50));  // dim blue = alive
+  pixels.show();
+  Serial.println("[LED] WS2812 status LED set");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SERIAL DIAGNOSTICS — periodic print
+// ═══════════════════════════════════════════════════════════════════
+uint32_t lastDiagMs = 0;
+#define  DIAG_INTERVAL_MS 5000
+
+void printDiagnostics() {
+  uint32_t now = millis();
+  if (now - lastDiagMs < DIAG_INTERVAL_MS) return;
+  lastDiagMs = now;
+
+  Serial.println("──── Lightboard Diagnostics ────");
+  Serial.printf("[BOARD] %s\n", IS_FRONT_BOARD ? "FRONT" : "REAR");
+  Serial.printf("[CAN]   cmd=0x%04X valid=%d age=%lu ms\n",
+                canCmdBits, canCmdValid,
+                canCmdValid ? (now - lastCanCmdMs) : 0UL);
+#if IS_FRONT_BOARD
+  Serial.printf("[SMART] current=%d desired=%d edgeActive=%d\n",
+                slCurrent, slDesired, slEdgeActive);
+#endif
+  Serial.printf("[CURR]  ");
+  for (int i = 0; i < 8; i++) Serial.printf("S%d=%dmA ", i, currentMa[i]);
+  Serial.println();
+  Serial.printf("[LUX]   %.1f lux\n", ambientLux);
+  Serial.printf("[SONAR] L=%d C=%d R=%d cm\n",
+                sonar[0].distanceCm, sonar[1].distanceCm, sonar[2].distanceCm);
+  Serial.printf("[PERIPH] MCP=%d ADS0=%d ADS1=%d VEML=%d\n",
+                mcp_ok, ads0_ok, ads1_ok, veml_ok);
+  Serial.printf("[UP]    %lu s\n", now / 1000);
+  Serial.println("────────────────────────────────");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  Serial.println("test");
-  Wire.begin(3, 4); // SDA=3, SCL=4
-  Wire.setClock(50000);
-  Serial.println("Booted");
-  for (int i = 0; i < 3; i++) {
-    Serial.print("---- I2C scan #");
-    Serial.print(i + 1);
-    Serial.println(" ----");
-    scanI2C();
-    delay(1000);
-  }
+  delay(500);
+  Serial.println("\n========================================");
+  Serial.printf(" Velion Lightboard Firmware — %s\n", IS_FRONT_BOARD ? "FRONT" : "REAR");
+  Serial.println("========================================");
 
-  // MCP23017
-  if (!mcp.begin_I2C(0x20)) {
-    Serial.println("MCP23017 not found!");
-    while (1);
-  }
+  Wire.begin(PIN_SDA, PIN_SCL);
 
-  for (int i = 0; i < 8; i++) mcp.pinMode(8 + i, OUTPUT); // GPB0..7
-  for (int i = 0; i < 3; i++) mcp.pinMode(i, OUTPUT);     // GPA0..2
+  setupGPIO();
+  setupCAN();
+  setupMCP();
+  setupADS();
+  setupVEML();
+  setupNeoPixel();
+  sonarInit();
 
-  allMosfetsOff();
-
-  // ADS1115
-
-  if (!ads0.begin(0x48)) {
-    Serial.println("ADS1115 (0x48) not found!");
-    while (1);
-  }
-
-  if (!ads1.begin(0x49)) {
-    Serial.println("ADS1115 (0x49) not found!");
-    while (1);
-  }
-
-  ads0.setGain(GAIN_ONE);
-  ads1.setGain(GAIN_ONE);
-
-// ---------------- VEML7700 ----------------
-if (!veml.begin()) {
-  Serial.println("VEML7700 not found at 0x10");
-  while (1);
+  Serial.println("[BOOT] Ready.\n");
 }
 
-  // Optional: make it explicit
-  veml.setGain(VEML7700_GAIN_1);
-  veml.setIntegrationTime(VEML7700_IT_100MS);
-
-  // WS2812
-  strip.begin();
-  strip.show();
-}
-
-// ---------------- Helpers ----------------
-
-void scanI2C() {
-  Serial.println("I2C scan start");
-
-  int found = 0;
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    uint8_t err = Wire.endTransmission();
-    Serial.println(addr);
-    if (err == 0) {
-      Serial.print("  Found device at 0x");
-      if (addr < 16) Serial.print("0");
-      Serial.println(addr, HEX);
-      found++;
-    }
-  }
-
-  if (found == 0) Serial.println("  No I2C devices found");
-  Serial.println("I2C scan end\n");
-}
-
-
-void allMosfetsOff() {
-  for (int i = 0; i < 8; i++) mcp.digitalWrite(8 + i, LOW);
-}
-
-void setMosfet(int ch) {
-  allMosfetsOff();
-  // GPB7..0 = MOSFET 0..7
-  int pin = 8 + (7 - ch);
-  mcp.digitalWrite(pin, HIGH);
-}
-
-float readCurrent(int ch) {
-  int16_t raw;
-  if (ch < 4) raw = ads0.readADC_SingleEnded(ch);
-  else raw = ads1.readADC_SingleEnded(ch - 4);
-
-  float voltage = raw * ADS_LSB;   // volts
-  return voltage / SHUNT;          // amps
-}
-
-void stepLed() {
-  uint32_t color;
-  if (ledState == 0) color = strip.Color(255, 0, 0);
-  else if (ledState == 1) color = strip.Color(0, 255, 0);
-  else color = strip.Color(0, 0, 255);
-
-  for (int i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, color);
-  strip.show();
-
-  ledState = (ledState + 1) % 3;
-}
-
-// ---------------- Loop ----------------
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN LOOP  (target ≥ 1 kHz)
+// ═══════════════════════════════════════════════════════════════════
 void loop() {
-  unsigned long now = millis();
-  bool led = 0;
-  // ---- MOSFET sequencing ----
-  if (now - lastMosfetSwitch >= 1000) {
-    setMosfet(mosfetIndex);
-    Serial.print("MOSFET ");
-    Serial.print(mosfetIndex);
-    Serial.println(" ON");
+  // 1. INPUT — read hardware & CAN
+  readCAN();
+  readCurrentSensors();
+  readAmbientLight();
+  sonarStep();
 
-    mosfetIndex = (mosfetIndex + 1) % 8;
-    lastMosfetSwitch = now;
-  }
+  // 2. OUTPUT — apply CAN command to MOSFETs
+  applyOutputs();
 
-  // ---- Current printing ----
-  /*
-  if (now - lastCurrentPrint >= 500) {
-    Serial.print("Currents [A]: ");
-    for (int i = 0; i < 8; i++) {
-      Serial.print(readCurrent(i), 3);
-      if (i < 7) Serial.print(", ");
-    }
-    Serial.println();
-    lastCurrentPrint = now;
-  }
+  // 3. CAN TX — broadcast telemetry
+  sendCanTelemetry();
 
-  // ---- Lux printing ----
-  if (now - lastLuxPrint >= 1000) {
-    float lux = veml.readLux();
-    Serial.print("Lux: ");
-    Serial.println(lux);
-    lastLuxPrint = now;
-  }
-*/
-  // ---- LED cycling ----
-  if (now - lastLedStep >= 1000) {
-    stepLed();
-    //digitalWrite(LED_BUILTIN, led);  // turn the LED on (HIGH is the voltage level)
-    led = !led;
-    lastLedStep = now;
-  }
-  if (now - lastLuxPrint >= 1000) {
-    float lux = veml.readLux();
+  // 4. DIAGNOSTICS — periodic serial print
+  printDiagnostics();
 
-    Serial.print("Ambient light: ");
-    Serial.print(lux, 2);
-    Serial.println(" lx");
-
-    lastLuxPrint = now;
-  }
+  // Minimal yield
+  delay(1);
 }

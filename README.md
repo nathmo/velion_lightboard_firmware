@@ -17,6 +17,8 @@ execute each FSM with the event queue
 OUTPUT 
 apply the state to the mosfet output
 
+there is a static flag I can set at compilation that tell if the board is the rear or front one. the code is almost the same, it just change the CAN id when broadcasting and the PIN mapping assignement
+
 # Pin mapping 
 GPIO 0 : Analog input  (PIN_SONAR_ECHO_A)
 GPIO 1 : Analog input  (PIN_SONAR_ECHO_B)
@@ -51,10 +53,29 @@ GPB5 : MOSFET_GATE_2 (output)
 GPB6 : MOSFET_GATE_1 (output)
 GPB7 : MOSFET_GATE_0 (output)
 
-GPA0 : EN_PIEZO_A
-GPA1 : EN_PIEZO_B
-GPA2 : EN_PIEZO_C
+GPA0 : EN_PIEZO_A_X
+GPA1 : EN_PIEZO_B_X
+GPA2 : EN_PIEZO_C_X
 
+GPA3 : EN_PIEZO_A_Y
+GPA4 : EN_PIEZO_B_Y
+GPA5 : EN_PIEZO_C_Y
+
+# Piezo Sonar Driving
+
+Each sonar channel (A, B, C) uses a piezoelectric transducer driven by two half-H bridges (X side and Y side).
+GPIO 9 (PIN_PIEZO_PWM_HALF_X) and GPIO 10 (PIN_PIEZO_PWM_HALF_Y) provide the 40 kHz PWM excitation signals.
+The MCP23017 GPA pins (EN_PIEZO_x_X, EN_PIEZO_x_Y) are enable lines for each half-H bridge:
+- EN = HIGH: half-H bridge active (drives the piezo)
+- EN = LOW: half-H bridge in High-Z (disconnected)
+
+To transmit on channel A: set EN_PIEZO_A_X=HIGH, EN_PIEZO_A_Y=HIGH, drive complementary 40 kHz on PWM_HALF_X and PWM_HALF_Y.
+To listen on channel A: set EN_PIEZO_A_X=LOW (High-Z one side), EN_PIEZO_A_Y=LOW, then read the analog echo on PIN_SONAR_ECHO_A.
+The echo signal is filtered with a Goertzel algorithm (single-frequency DFT at 40 kHz) to detect the return pulse magnitude.
+Distance is computed from the time-of-flight between excitation start and the echo threshold crossing.
+
+**NOTE:** There is currently a hardware bug — the X and Y enable select lines are not independently routable
+per channel, so sonar excitation is disabled in firmware. The code is implemented but commented out.
 # CAN codes
 
 
@@ -69,70 +90,54 @@ Device addressing is handled by **distinct CAN IDs per board**, so no extra addr
 
 ## Input (Control/Set)
 
-| CAN ID | DLC | Purpose | Payload |
-|--------|-----|---------|---------|
-| `0x120` | 1 | Set all front outputs | **Byte 0:** 8-bit control (see Front Bit Mapping) |
 | `0x121` | 5 | Set current thresholds for alert | **Byte 0:** Channel (0–7)<br>**Bytes 1–2:** Low threshold mA (0 = disable)<br>**Bytes 3–4:** High threshold mA (0 = disable) |
-| Bit | Output |
-|-----|--------|
-| 0 | DRL |
-| 1 | Position Left |
-| 2 | Position Right |
-| 3 | Left Blinker |
-| 4 | Right Blinker |
-| 5 | Low Beam |
-| 6 | High Beam |
-| 7 | Horn |
 
+for the control of the light, we read packet with ID 0x400 made of two byte with the following structure :
+| Bit | Output | Mosfet |
+|-----|--------|--------|
+| 0 | horn | MOSFET_GATE_4 (frontboard only) |
+| 1 | brake | MOSFET_GATE_1 (rearboard only) |
+| 2 | tail | MOSFET_GATE_0 (rearboard only) |
+| 3 | right blinker | MOSFET_GATE_3  |
+| 4 | left blinker | MOSFET_GATE_2  |
+| 5 | high beam |MOSFET_GATE_1 READ NOTE (frontboard only) |
+| 6 | Low Beam |MOSFET_GATE_1 READ NOTE (frontboard only) |
+| 7 | Day (DRL) | MOSFET_GATE_0 (frontboard only) |
+| 8 | flash |  MOSFET_GATE_7 (rearboard only) |
+| 9 | fog |  MOSFET_GATE_6 (rearboard only) |
+| 10 | reverse |  MOSFET_GATE_5 (rearboard only) |
+
+we should reflect the bit state to the mosfet. if no command is received for more than 3 second, we turn off the output.
+
+
+for the low beam and high beam, we have a "smart" light where rising EDGE toggle the state. the state machine is as follow :
+
+(after BOOT) -> DRL only -(rising edge)> low beam -(rising edge)> high beam
+high beam -(rising edge)> low beam
+
+We need to implement it too and keep track of the state so that when low beam bit is active we switch to low beam, and when high beam bit is active we switch to high beam. if both are active, we stay / go to high beam. 
+
+# Ouput CAN
+
+
+0x481 / 0x491 should be 2 byte that 
+| rearboard         | `0x481–0x490` |
+| frontboard        | `0x491–0x500` |
 ## Output (Status/Telemetry)
 
 | CAN ID | DLC | Purpose | Payload |
 |--------|-----|---------|---------|
-| `0x131` | 1 | Front output status | **Byte 0:** 8-bit status (same bit mapping as control) |
-| `0x132` | 5 | Report current thresholds | Same payload layout as `0x121` |
-| `0x140`–`0x147` | 2 | Current per channel | **Bytes 0–1:** INT16 current in mA for channel 0–7 (CAN ID = `0x140 + channel`) |
-| `0x150` | 3 | Front proximity | **Byte 0:** Left sensor cm<br>**Byte 1:** Center sensor cm<br>**Byte 2:** Right sensor cm |
-| `0x151` | 2 | Ambient light | **Bytes 0–1:** Fixed-exponent lux (see encoding below) |
+| `0x481/0x491` | 1 | mosfet output status | **Byte 0:** 8-bit status (same bit mapping as control) |
+| `0x482/0x492` | 5 | Report current thresholds | Same payload layout as `0x121` |
+| `0x483/0x493` | 2 | Current per channel | **Bytes 0–1:** INT16 current in mA for channel 0–7 (CAN ID offset = base + channel) |
+| `0x484/0x494` | 3 | proximity | **Byte 0:** Left sensor cm<br>**Byte 1:** Center sensor cm<br>**Byte 2:** Right sensor cm |
+| `0x485/0x495` | 2 | Ambient light | **Bytes 0–1:** Fixed-exponent lux (see encoding below) |
 
----
-
-# Rear Lightboard (`0x16`) — CAN IDs
-
-## Input (Control/Set)
-
-| CAN ID | DLC | Purpose | Payload |
-|--------|-----|---------|---------|
-| `0x220` | 1 | Set all front outputs | **Byte 0:** 8-bit control (see Front Bit Mapping) |
-| `0x221` | 5 | Set current thresholds for alert | **Byte 0:** Channel (0–7)<br>**Bytes 1–2:** Low threshold mA (0 = disable)<br>**Bytes 3–4:** High threshold mA (0 = disable) |
-
-| Bit | Output |
-|-----|--------|
-| 0 | Brake |
-| 1 | Left Blinker |
-| 2 | Right Blinker |
-| 3 | Rear Position |
-| 4 | Fog |
-| 5 | Reverse |
-| 6 | License Plate |
-| 7 | Reserved |
-
-## Output (Status/Telemetry)
-
-| CAN ID | DLC | Purpose | Payload |
-|--------|-----|---------|---------|
-| `0x231` | 1 | Front output status | **Byte 0:** 8-bit status (same bit mapping as control) |
-| `0x232` | 5 | Report current thresholds | Same payload layout as `0x121` |
-| `0x240`–`0x247` | 2 | Current per channel | **Bytes 0–1:** INT16 current in mA for channel 0–7 (CAN ID = `0x240 + channel`) |
-| `0x250` | 3 | Front proximity | **Byte 0:** Left sensor cm<br>**Byte 1:** Center sensor cm<br>**Byte 2:** Right sensor cm |
-| `0x251` | 2 | Ambient light | **Bytes 0–1:** Fixed-exponent lux (see encoding below) |
-
----
 
 ## Proximity Encoding (All Boards)
 - **Byte value 0:** Sensor error / dirty
 - **Byte value 255:** No object in range
 - **Byte value 1–254:** Distance in cm
-
 ---
 
 ## Ambient Light Encoding (VEML7700 Fixed Exponent, 0.1–120k lux)
@@ -145,106 +150,4 @@ Device addressing is handled by **distinct CAN IDs per board**, so no extra addr
 ```
 lux = M × 2^E × 0.1
 ```
-
----
-
-## Full Packet Examples
-### Example 1 — Front: Turn DRL + Horn ON
-| CAN ID | DLC | Data |
-|--------|-----|------|
-| `0x120` | `1` | `0x81` |
-
-**Explanation:**  
-`0x81 = 1000 0001b` → DRL ON (bit 0) + Horn ON (bit 7).
-
----
-
-### Example 2 — Front: Report Current for Channel 3 (Left Blinker)
-| CAN ID | DLC | Data |
-|--------|-----|------|
-| `0x143` | `2` | `0x2C` `0x01` |
-
-**Explanation:**  
-`0x012C = 300 mA` on channel 3.
-
----
-
-### Example 3 — Rear: Proximity Telemetry
-| CAN ID | DLC | Data |
-|--------|-----|------|
-| `0x250` | `3` | `0x32` `0xFF` `0x00` |
-
-**Explanation:**  
-- Left sensor = 50 cm  
-- Center = no object (255)  
-- Right = error/dirty (0)
-
----
-
-### Example 4 — Front: Ambient Light = ~50,000 lux
-| CAN ID | DLC | Data |
-|--------|-----|------|
-| `0x151` | `2` | `0xD2` `0x04` |
-
-**Explanation:**  
-- Encoded value = `0x04D2`  
-- If `E = 1` and `M = 0x0D2 = 210` → `lux = 210 × 2^1 × 0.1 = 42 lux`  
-- Adjust E/M for exact lux target (example shows decoding form).  
-
----
-
-
-
-# Input event
-current bellow threshold low for light 0-7
-current above threshold high for light 0-7
-proximity distance detect something
-luminosity above threshold X
-luminosity bellow threshold Y
-
-# State machines
-general rules about timer, if set while running, is start again at the set time but will not generate more than ONE timeout event.
-we should have an event queue and a STATE table. the state table is for global state that must be present or absent for something to happen with an event. the event are for every state change.
-
-# STATE MACHINES (FSM DEFINITIONS)
-
-## GLOBAL FSM RULES
-
-* FSMs consume events from a **global event queue**
-* Each FSM has **its own timer(s)**
-
-  * If a timer is started while already running, it **restarts**
-  * A timer **emits only ONE timeout event**
-* `ST_` = current state
-* `EV_` = discrete event
-* Transitions are **edge-driven only**
-* Outputs are applied in the **output stage**, never in input logic
-
----
-
-## blinker FSM
-
-### States
-
-```
-ST_BLINKER_OFF
-ST_BLINKER_WARNING_ON
-ST_BLINKER_WARNING_OFF
-ST_BLINKER_LEFT_ON
-ST_BLINKER_LEFT_OFF
-```
-
-### Transitions
-
-```
-
-```
-
-### Outputs
-
-```
-
-```
-
----
 
