@@ -245,6 +245,66 @@ uint16_t canCmdBits        = 0;       // last received 11-bit control word
 uint16_t canCmdBitsPrev    = 0;       // previous cycle (for edge detection)
 #define  CAN_CMD_TIMEOUT_MS 3000
 
+// Manual MOSFET override per CAN control bit.
+// enabled=false -> follow CAN/watchdog behavior
+// enabled=true  -> force output to manual state
+bool manualOverrideEnabled[11] = {false};
+bool manualOverrideState[11]   = {false};
+
+bool isManualControllableBit(int b) {
+  if (b < 0 || b >= 11) return false;
+  return bitToMosfetPin[b] >= 0;
+}
+
+bool parseBitArg(int &bitOut) {
+  if (!webServer.hasArg("bit")) return false;
+  String bitStr = webServer.arg("bit");
+  if (bitStr.length() == 0) return false;
+
+  char *endPtr = NULL;
+  long value = strtol(bitStr.c_str(), &endPtr, 10);
+  if (endPtr == bitStr.c_str() || *endPtr != '\0') return false;
+  if (value < 0 || value >= 11) return false;
+
+  bitOut = (int)value;
+  return true;
+}
+
+void sendRedirectToRoot() {
+  webServer.sendHeader("Location", "/");
+  webServer.send(303, "text/plain", "");
+}
+
+void handleToggleOutput() {
+  int bit = -1;
+  if (!parseBitArg(bit) || !isManualControllableBit(bit)) {
+    webServer.send(400, "text/plain", "Invalid output bit");
+    return;
+  }
+
+  manualOverrideEnabled[bit] = true;
+  manualOverrideState[bit] = !manualOverrideState[bit];
+  sendRedirectToRoot();
+}
+
+void handleAutoOutput() {
+  int bit = -1;
+  if (!parseBitArg(bit) || !isManualControllableBit(bit)) {
+    webServer.send(400, "text/plain", "Invalid output bit");
+    return;
+  }
+
+  manualOverrideEnabled[bit] = false;
+  sendRedirectToRoot();
+}
+
+void handleAutoAllOutputs() {
+  for (int b = 0; b < 11; b++) {
+    manualOverrideEnabled[b] = false;
+  }
+  sendRedirectToRoot();
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  CAN RX LOG — stores latest payload for each unique received ID
 // ═══════════════════════════════════════════════════════════════════
@@ -756,6 +816,9 @@ void applyOutputs() {
     int8_t pin = bitToMosfetPin[b];
     if (pin < 0) continue;
     bool on = (bits >> b) & 1;
+    if (manualOverrideEnabled[b]) {
+      on = manualOverrideState[b];
+    }
     mcp.digitalWrite(pin, on ? HIGH : LOW);
   }
 
@@ -900,6 +963,9 @@ void handleRoot() {
           "td{padding:3px 8px;border-bottom:1px solid #1c1c1c;font-size:.85em}"
           ".on{color:#3d3;font-weight:bold}.off{color:#444}"
           ".warn{color:#fa4}.err{color:#f55}.dim{color:#444;font-size:.8em}"
+          "button{background:#1c2a1c;color:#9f9;border:1px solid #2e4c2e;padding:2px 8px;cursor:pointer}"
+          "button.alt{background:#2a1c1c;color:#f99;border-color:#4c2e2e}"
+          "form{display:inline;margin:0}"
           "</style></head><body>";
 
   html += "<h2>&#9889; Velion ";
@@ -930,12 +996,15 @@ void handleRoot() {
     "Tail", "Brake", "Horn", "Reverse", "Fog", "Flash"
   };
   html += "<h3>MOSFET Outputs</h3>"
-          "<table><tr><th>Signal</th><th>Gate</th><th>State</th></tr>";
+          "<p class='dim'>Manual controls override CAN until set back to AUTO. "
+          "<a href='/auto_all'>Set all AUTO</a></p>"
+          "<table><tr><th>Signal</th><th>Gate</th><th>State</th><th>Control</th></tr>";
   for (int b = 0; b < 11; b++) {
     int mcpPin = bitToMosfetPin[b];
     if (mcpPin < 0) continue;
     int gateIdx = 15 - mcpPin;
-    bool on = canCmdValid && ((canCmdBits >> b) & 1);
+    bool canOn = canCmdValid && ((canCmdBits >> b) & 1);
+    bool on = manualOverrideEnabled[b] ? manualOverrideState[b] : canOn;
     html += "<tr><td>";
     html += bitNames[b];
     snprintf(buf, sizeof(buf), "%d", gateIdx);
@@ -943,6 +1012,18 @@ void handleRoot() {
     html += buf;
     html += "</td><td>";
     html += on ? "<span class='on'>ON</span>" : "<span class='off'>OFF</span>";
+    if (manualOverrideEnabled[b]) {
+      html += " <span class='warn'>(MANUAL)</span>";
+    } else {
+      html += " <span class='dim'>(CAN)</span>";
+    }
+    html += "</td><td>";
+    html += "<form method='get' action='/toggle'><input type='hidden' name='bit' value='";
+    html += String(b);
+    html += "'><button type='submit'>Toggle</button></form> ";
+    html += "<form method='get' action='/auto'><input type='hidden' name='bit' value='";
+    html += String(b);
+    html += "'><button type='submit' class='alt'>AUTO</button></form>";
     html += "</td></tr>";
   }
 #if IS_FRONT_BOARD
@@ -956,7 +1037,7 @@ void handleRoot() {
       html += slNames[slCurrent];
       html += "</span>";
     }
-    html += "</td></tr>";
+    html += "</td><td><span class='dim'>FSM controlled</span></td></tr>";
   }
 #endif
   html += "</table>";
@@ -994,12 +1075,30 @@ void handleRoot() {
   }
   html += "</table>";
 
-  // ── CAN RX Log
-  html += "<h3>CAN RX Log</h3>"
-          "<table><tr><th>ID</th><th>DLC</th><th>Data (hex)</th><th>Age</th></tr>";
-  bool anyRx = false;
+  // ── CAN RX Snapshot (latest packet per ID)
+  html += "<h3>CAN RX Snapshot</h3>"
+          "<p class='dim'>One row per CAN ID (latest packet only), sorted by ID.</p>"
+          "<table><tr><th>ID</th><th>DLC</th><th>Latest Data (hex)</th><th>Age</th></tr>";
+
+  // Build a sorted view of used slots by CAN ID (ascending)
+  int rxIdx[CAN_RX_LOG_SIZE];
+  int rxCount = 0;
   for (int i = 0; i < CAN_RX_LOG_SIZE; i++) {
-    if (!canRxLog[i].used) continue;
+    if (canRxLog[i].used) rxIdx[rxCount++] = i;
+  }
+  for (int i = 0; i < rxCount - 1; i++) {
+    for (int j = i + 1; j < rxCount; j++) {
+      if (canRxLog[rxIdx[j]].id < canRxLog[rxIdx[i]].id) {
+        int t = rxIdx[i];
+        rxIdx[i] = rxIdx[j];
+        rxIdx[j] = t;
+      }
+    }
+  }
+
+  bool anyRx = false;
+  for (int n = 0; n < rxCount; n++) {
+    int i = rxIdx[n];
     anyRx = true;
     snprintf(buf, sizeof(buf), "0x%03lX", (unsigned long)canRxLog[i].id);
     html += "<tr><td>";
@@ -1064,6 +1163,9 @@ void setupWiFi() {
   }
 
   webServer.on("/", handleRoot);
+  webServer.on("/toggle", handleToggleOutput);
+  webServer.on("/auto", handleAutoOutput);
+  webServer.on("/auto_all", handleAutoAllOutputs);
   webServer.begin();
   Serial.println("[WiFi] HTTP server listening on port 80 (STA mode)");
 }
