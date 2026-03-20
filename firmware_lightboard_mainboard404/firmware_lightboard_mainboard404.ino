@@ -71,6 +71,7 @@ static const uint8_t kMosfetChannelToMcpPin[8] = {15, 14, 13, 12, 11, 10, 9, 8};
 // Input shaping
 // --------------------------
 #define THROTTLE_DEADBAND        0x40
+#define MAX_CAN_LEVEL            32500
 
 // --------------------------
 // WiFi AP
@@ -299,7 +300,7 @@ String canMonitorJson() {
 }
 
 int16_t scaleThrottleToInt16(uint8_t raw) {
-  return (int16_t)(((uint32_t)raw * 32767UL) / 255UL);
+  return (int16_t)(((uint32_t)raw * (uint32_t)MAX_CAN_LEVEL) / 255UL);
 }
 
 bool validChannel(int v) {
