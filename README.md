@@ -92,6 +92,25 @@ Device addressing is handled by **distinct CAN IDs per board**, so no extra addr
 
 | `0x121` | 5 | Set current thresholds for alert | **Byte 0:** Channel (0–7)<br>**Bytes 1–2:** Low threshold mA (0 = disable)<br>**Bytes 3–4:** High threshold mA (0 = disable) |
 
+ID 0x400, 2 byte :   
+0010 0001 0000 0000 -> rien
+0010 0010 0000 0000 -> low beam
+0010 0100 0000 0000 -> full beam
+0010 0011 0000 0000 -> appelle de phare
+1010 0001 0000 0000 -> horn
+1010 1001 0000 0000 -> left blinker
+1011 0001 0000 0000 -> right blinker
+
+ID 0x405 2 byte :
+1000 0000 4F -> button A
+0100 0000 4F -> button B
+
+ID 0x407, 1 byte -> analog value for the throttle
+
+
+
+
+
 for the control of the light, we read packet with ID 0x400 made of two byte with the following structure :
 | Bit | Output | Mosfet |
 |-----|--------|--------|
