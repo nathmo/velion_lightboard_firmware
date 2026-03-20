@@ -6,7 +6,7 @@
  *   1. INPUT  — read CAN RX, ADC current sensors, ambient light, sonar echo
  *   2. EVENT  — generate discrete events from input state changes
  *   3. FSM    — step each state machine with current events
- *   4. OUTPUT — apply FSM states to HW (MOSFETs via MCP23017, CAN TX)
+ *   4. OUTPUT — apply FSM states to HW (MOSFETs via MCP23017, C AN TX)
  *
  * Compile-time flag IS_FRONT_BOARD selects front vs rear pin/CAN mapping.
  *
@@ -24,6 +24,33 @@
 #include <Adafruit_ADS1X15.h>
 #include <Adafruit_VEML7700.h>
 #include "driver/twai.h"
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ── Type definitions placed here so Arduino's auto-generated function
+// ── prototypes (injected after the last #include) can see these types.
+enum SonarState : uint8_t {
+  SONAR_IDLE,
+  SONAR_EXCITING,
+  SONAR_LISTENING,
+  SONAR_DONE
+};
+
+struct SonarChannel {
+  uint8_t     echoPin;
+  uint8_t     enPinX;
+  uint8_t     enPinY;
+  SonarState  state;
+  uint32_t    exciteStartUs;
+  uint32_t    listenStartUs;
+  uint8_t     distanceCm;     // 0=error, 255=no object, 1-254=cm
+  float       goertzelQ0;
+  float       goertzelQ1;
+  float       goertzelQ2;
+  uint16_t    sampleCount;
+  bool        echoDetected;
+  uint32_t    echoTimeUs;
+};
 
 // ═══════════════════════════════════════════════════════════════════
 //  BOARD SELECTION — set to true for front, false for rear
@@ -70,17 +97,17 @@
 // ═══════════════════════════════════════════════════════════════════
 //  CAN CONTROL BIT MAPPING (from 0x400, 2-byte LE)
 // ═══════════════════════════════════════════════════════════════════
-#define BIT_HORN         0   // frontboard only
-#define BIT_BRAKE        1   // rearboard only
-#define BIT_TAIL         2   // rearboard only
-#define BIT_RIGHT_BLINK  3
-#define BIT_LEFT_BLINK   4
-#define BIT_HIGH_BEAM    5   // frontboard only — edge-driven smart light
-#define BIT_LOW_BEAM     6   // frontboard only — edge-driven smart light
-#define BIT_DRL          7   // frontboard only
-#define BIT_FLASH        8   // rearboard only
+#define BIT_DRL          0   // frontboard only (daylight)
+#define BIT_LOW_BEAM     1   // frontboard only — edge-driven smart light
+#define BIT_HIGH_BEAM    2   // frontboard only — edge-driven smart light
+#define BIT_LEFT_BLINK   3
+#define BIT_RIGHT_BLINK  4
+#define BIT_TAIL         5   // rearboard only
+#define BIT_BRAKE        6   // rearboard only
+#define BIT_HORN         7   // frontboard only
+#define BIT_REVERSE      8   // rearboard only
 #define BIT_FOG          9   // rearboard only
-#define BIT_REVERSE     10   // rearboard only
+#define BIT_FLASH       10   // rearboard only
 
 // ═══════════════════════════════════════════════════════════════════
 //  CAN IDs
@@ -106,36 +133,36 @@
 //  -1 = not applicable on this board variant
 // ═══════════════════════════════════════════════════════════════════
 #if IS_FRONT_BOARD
-  // Bit: 0=horn→G4, 1=N/A, 2=N/A, 3=Rblink→G3, 4=Lblink→G2,
-  //      5=HiBeam→G1(smart), 6=LowBeam→G1(smart), 7=DRL→G0
+  // Bit: 0=DRL→G0, 1=LowBeam→G1(smart), 2=HiBeam→G1(smart),
+  //      3=Lblink→G2, 4=Rblink→G3, 5=N/A, 6=N/A, 7=horn→G4
   static const int8_t bitToMosfetPin[11] = {
-    MCP_MOSFET_GATE_4,  // 0  horn
-    -1,                  // 1  brake (rear only)
-    -1,                  // 2  tail  (rear only)
-    MCP_MOSFET_GATE_3,  // 3  right blinker
-    MCP_MOSFET_GATE_2,  // 4  left blinker
-    -1,                  // 5  high beam (handled by smart light FSM)
-    -1,                  // 6  low beam  (handled by smart light FSM)
-    MCP_MOSFET_GATE_0,  // 7  DRL
-    -1,                  // 8  flash (rear only)
-    -1,                  // 9  fog   (rear only)
-    -1                   // 10 reverse (rear only)
+    MCP_MOSFET_GATE_0,  // 0  DRL
+    -1,                  // 1  low beam  (handled by smart light FSM)
+    -1,                  // 2  high beam (handled by smart light FSM)
+    MCP_MOSFET_GATE_2,  // 3  left blinker
+    MCP_MOSFET_GATE_3,  // 4  right blinker
+    -1,                  // 5  tail (rear only)
+    -1,                  // 6  brake (rear only)
+    MCP_MOSFET_GATE_4,  // 7  horn
+    -1,                  // 8  reverse (rear only)
+    -1,                  // 9  fog     (rear only)
+    -1                   // 10 flash   (rear only)
   };
 #else
-  // Rear: 0=N/A, 1=brake→G1, 2=tail→G0, 3=Rblink→G3, 4=Lblink→G2,
-  //       5=N/A, 6=N/A, 7=N/A, 8=flash→G7, 9=fog→G6, 10=reverse→G5
+  // Rear: 0=N/A, 1=N/A, 2=N/A, 3=Lblink→G2, 4=Rblink→G3,
+  //       5=tail→G0, 6=brake→G1, 7=N/A, 8=reverse→G5, 9=fog→G6, 10=flash→G7
   static const int8_t bitToMosfetPin[11] = {
-    -1,                  // 0  horn (front only)
-    MCP_MOSFET_GATE_1,  // 1  brake
-    MCP_MOSFET_GATE_0,  // 2  tail
-    MCP_MOSFET_GATE_3,  // 3  right blinker
-    MCP_MOSFET_GATE_2,  // 4  left blinker
-    -1,                  // 5  high beam (front only)
-    -1,                  // 6  low beam  (front only)
-    -1,                  // 7  DRL (front only)
-    MCP_MOSFET_GATE_7,  // 8  flash
+    -1,                  // 0  DRL (front only)
+    -1,                  // 1  low beam  (front only)
+    -1,                  // 2  high beam (front only)
+    MCP_MOSFET_GATE_2,  // 3  left blinker
+    MCP_MOSFET_GATE_3,  // 4  right blinker
+    MCP_MOSFET_GATE_0,  // 5  tail
+    MCP_MOSFET_GATE_1,  // 6  brake
+    -1,                  // 7  horn (front only)
+    MCP_MOSFET_GATE_5,  // 8  reverse
     MCP_MOSFET_GATE_6,  // 9  fog
-    MCP_MOSFET_GATE_5   // 10 reverse
+    MCP_MOSFET_GATE_7   // 10 flash
   };
 #endif
 
@@ -218,6 +245,100 @@ uint16_t canCmdBits        = 0;       // last received 11-bit control word
 uint16_t canCmdBitsPrev    = 0;       // previous cycle (for edge detection)
 #define  CAN_CMD_TIMEOUT_MS 3000
 
+// Manual MOSFET override per CAN control bit.
+// enabled=false -> follow CAN/watchdog behavior
+// enabled=true  -> force output to manual state
+bool manualOverrideEnabled[11] = {false};
+bool manualOverrideState[11]   = {false};
+
+bool isManualControllableBit(int b) {
+  if (b < 0 || b >= 11) return false;
+  return bitToMosfetPin[b] >= 0;
+}
+
+bool parseBitArg(int &bitOut) {
+  if (!webServer.hasArg("bit")) return false;
+  String bitStr = webServer.arg("bit");
+  if (bitStr.length() == 0) return false;
+
+  char *endPtr = NULL;
+  long value = strtol(bitStr.c_str(), &endPtr, 10);
+  if (endPtr == bitStr.c_str() || *endPtr != '\0') return false;
+  if (value < 0 || value >= 11) return false;
+
+  bitOut = (int)value;
+  return true;
+}
+
+void sendRedirectToRoot() {
+  webServer.sendHeader("Location", "/");
+  webServer.send(303, "text/plain", "");
+}
+
+void handleToggleOutput() {
+  int bit = -1;
+  if (!parseBitArg(bit) || !isManualControllableBit(bit)) {
+    webServer.send(400, "text/plain", "Invalid output bit");
+    return;
+  }
+
+  manualOverrideEnabled[bit] = true;
+  manualOverrideState[bit] = !manualOverrideState[bit];
+  sendRedirectToRoot();
+}
+
+void handleAutoOutput() {
+  int bit = -1;
+  if (!parseBitArg(bit) || !isManualControllableBit(bit)) {
+    webServer.send(400, "text/plain", "Invalid output bit");
+    return;
+  }
+
+  manualOverrideEnabled[bit] = false;
+  sendRedirectToRoot();
+}
+
+void handleAutoAllOutputs() {
+  for (int b = 0; b < 11; b++) {
+    manualOverrideEnabled[b] = false;
+  }
+  sendRedirectToRoot();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CAN RX LOG — stores latest payload for each unique received ID
+// ═══════════════════════════════════════════════════════════════════
+#define CAN_RX_LOG_SIZE  12
+
+struct CanRxRecord {
+  uint32_t id;
+  uint8_t  dlc;
+  uint8_t  data[8];
+  uint32_t lastMs;
+  bool     used;
+};
+
+CanRxRecord canRxLog[CAN_RX_LOG_SIZE] = {};
+
+// ═══════════════════════════════════════════════════════════════════
+//  WIFI HOTSPOT & WEB SERVER CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════
+#define WIFI_SSID     "Velion-Dashboard"
+#define WIFI_PASSWORD "velion1234"
+
+// Front/rear boards join the mainboard AP using fixed IPs.
+const IPAddress WIFI_GATEWAY(192, 168, 4, 1);
+const IPAddress WIFI_SUBNET(255, 255, 255, 0);
+
+#if IS_FRONT_BOARD
+const IPAddress WIFI_LOCAL_IP(192, 168, 4, 2);
+#else
+const IPAddress WIFI_LOCAL_IP(192, 168, 4, 3);
+#endif
+
+// HTTP dashboard server (served from each lightboard)
+WebServer webServer(80);
+
 // ═══════════════════════════════════════════════════════════════════
 //  CURRENT SENSE (ADS1115)
 //  Each ADC channel measures voltage across a 1 mΩ shunt to GND.
@@ -269,29 +390,6 @@ uint32_t lastVemlReadMs  = 0;
 // k = round(N * f_target / f_sample) = round(64 * 40000 / 80000) = 32
 // coeff = 2*cos(2*PI*k/N) = 2*cos(2*PI*32/64) = 2*cos(PI) = -2.0
 static const float GOERTZEL_COEFF = -2.0f;
-
-enum SonarState : uint8_t {
-  SONAR_IDLE,
-  SONAR_EXCITING,
-  SONAR_LISTENING,
-  SONAR_DONE
-};
-
-struct SonarChannel {
-  uint8_t     echoPin;
-  uint8_t     enPinX;
-  uint8_t     enPinY;
-  SonarState  state;
-  uint32_t    exciteStartUs;
-  uint32_t    listenStartUs;
-  uint8_t     distanceCm;     // 0=error, 255=no object, 1-254=cm
-  float       goertzelQ0;
-  float       goertzelQ1;
-  float       goertzelQ2;
-  uint16_t    sampleCount;
-  bool        echoDetected;
-  uint32_t    echoTimeUs;
-};
 
 SonarChannel sonar[SONAR_CHANNELS];
 uint8_t      sonarActiveCh = 0;
@@ -551,6 +649,27 @@ void readCAN() {
       default:
         break;
     }
+
+    // Update CAN RX log for the web dashboard
+    {
+      int freeSlot = -1, oldestIdx = 0;
+      uint32_t oldestMs = UINT32_MAX;
+      for (int i = 0; i < CAN_RX_LOG_SIZE; i++) {
+        if (canRxLog[i].used && canRxLog[i].id == msg.identifier) {
+          freeSlot = i;
+          break;
+        }
+        if (!canRxLog[i].used && freeSlot < 0) freeSlot = i;
+        if (canRxLog[i].lastMs < oldestMs) { oldestMs = canRxLog[i].lastMs; oldestIdx = i; }
+      }
+      if (freeSlot < 0) freeSlot = oldestIdx;
+      canRxLog[freeSlot].id  = msg.identifier;
+      canRxLog[freeSlot].dlc = msg.data_length_code;
+      uint8_t dlen = msg.data_length_code < 8 ? msg.data_length_code : 8;
+      memcpy(canRxLog[freeSlot].data, msg.data, dlen);
+      canRxLog[freeSlot].lastMs = millis();
+      canRxLog[freeSlot].used   = true;
+    }
   }
 }
 
@@ -697,6 +816,9 @@ void applyOutputs() {
     int8_t pin = bitToMosfetPin[b];
     if (pin < 0) continue;
     bool on = (bits >> b) & 1;
+    if (manualOverrideEnabled[b]) {
+      on = manualOverrideState[b];
+    }
     mcp.digitalWrite(pin, on ? HIGH : LOW);
   }
 
@@ -818,6 +940,237 @@ void setupNeoPixel() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  WI-FI DASHBOARD — HTTP page handler
+// ═══════════════════════════════════════════════════════════════════
+void handleRoot() {
+  uint32_t now = millis();
+  char buf[32];
+  String html;
+  html.reserve(4096);
+
+  // ── Head
+  html += "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+          "<meta http-equiv='refresh' content='2'>"
+          "<title>Velion ";
+  html += IS_FRONT_BOARD ? "Frontboard" : "Rearboard";
+  html += "</title>"
+          "<style>"
+          "body{font-family:monospace;background:#111;color:#ddd;padding:12px;margin:0}"
+          "h2{color:#4af;margin:0 0 10px}"
+          "h3{color:#777;margin:10px 0 3px;font-size:.82em;text-transform:uppercase}"
+          "table{border-collapse:collapse;width:100%;max-width:600px;margin-bottom:6px}"
+          "th{background:#1a1a1a;padding:3px 8px;text-align:left;color:#555;font-size:.78em}"
+          "td{padding:3px 8px;border-bottom:1px solid #1c1c1c;font-size:.85em}"
+          ".on{color:#3d3;font-weight:bold}.off{color:#444}"
+          ".warn{color:#fa4}.err{color:#f55}.dim{color:#444;font-size:.8em}"
+          "button{background:#1c2a1c;color:#9f9;border:1px solid #2e4c2e;padding:2px 8px;cursor:pointer}"
+          "button.alt{background:#2a1c1c;color:#f99;border-color:#4c2e2e}"
+          "form{display:inline;margin:0}"
+          "</style></head><body>";
+
+  html += "<h2>&#9889; Velion ";
+  html += IS_FRONT_BOARD ? "Frontboard" : "Rearboard";
+  html += "</h2>";
+
+  // ── CAN Command
+  html += "<h3>CAN Command</h3>"
+          "<table><tr><th>Field</th><th>Value</th></tr>"
+          "<tr><td>Status</td><td>";
+  html += canCmdValid ? "<span class='on'>&#10003; VALID</span>"
+                      : "<span class='warn'>&#9888; WATCHDOG &mdash; no command</span>";
+  snprintf(buf, sizeof(buf), "%04X", canCmdBits);
+  html += "</td></tr><tr><td>Control word</td><td>0x";
+  html += buf;
+  html += "</td></tr><tr><td>Last received</td><td>";
+  if (canCmdValid) {
+    snprintf(buf, sizeof(buf), "%lu ms ago", now - lastCanCmdMs);
+    html += buf;
+  } else {
+    html += "<span class='dim'>&mdash;</span>";
+  }
+  html += "</td></tr></table>";
+
+  // ── MOSFET Outputs
+  static const char* bitNames[11] = {
+    "DRL", "Low Beam", "High Beam", "Left Blink", "Right Blink",
+    "Tail", "Brake", "Horn", "Reverse", "Fog", "Flash"
+  };
+  html += "<h3>MOSFET Outputs</h3>"
+          "<p class='dim'>Manual controls override CAN until set back to AUTO. "
+          "<a href='/auto_all'>Set all AUTO</a></p>"
+          "<table><tr><th>Signal</th><th>Gate</th><th>State</th><th>Control</th></tr>";
+  for (int b = 0; b < 11; b++) {
+    int mcpPin = bitToMosfetPin[b];
+    if (mcpPin < 0) continue;
+    int gateIdx = 15 - mcpPin;
+    bool canOn = canCmdValid && ((canCmdBits >> b) & 1);
+    bool on = manualOverrideEnabled[b] ? manualOverrideState[b] : canOn;
+    html += "<tr><td>";
+    html += bitNames[b];
+    snprintf(buf, sizeof(buf), "%d", gateIdx);
+    html += "</td><td>Gate ";
+    html += buf;
+    html += "</td><td>";
+    html += on ? "<span class='on'>ON</span>" : "<span class='off'>OFF</span>";
+    if (manualOverrideEnabled[b]) {
+      html += " <span class='warn'>(MANUAL)</span>";
+    } else {
+      html += " <span class='dim'>(CAN)</span>";
+    }
+    html += "</td><td>";
+    html += "<form method='get' action='/toggle'><input type='hidden' name='bit' value='";
+    html += String(b);
+    html += "'><button type='submit'>Toggle</button></form> ";
+    html += "<form method='get' action='/auto'><input type='hidden' name='bit' value='";
+    html += String(b);
+    html += "'><button type='submit' class='alt'>AUTO</button></form>";
+    html += "</td></tr>";
+  }
+#if IS_FRONT_BOARD
+  {
+    static const char* slNames[] = {"DRL", "Low Beam", "High Beam"};
+    html += "<tr><td>Smart Light</td><td>Gate 1</td><td>";
+    if (slEdgeActive) {
+      html += "<span class='warn'>&#8594; pulsing edge</span>";
+    } else {
+      html += "<span class='on'>";
+      html += slNames[slCurrent];
+      html += "</span>";
+    }
+    html += "</td><td><span class='dim'>FSM controlled</span></td></tr>";
+  }
+#endif
+  html += "</table>";
+
+  // ── Ambient Light
+  html += "<h3>Ambient Light</h3>"
+          "<table><tr><th>Sensor</th><th>Value</th></tr>"
+          "<tr><td>VEML7700</td><td>";
+  if (veml_ok) {
+    snprintf(buf, sizeof(buf), "%.1f lux", ambientLux);
+    html += buf;
+  } else {
+    html += "<span class='err'>Not found</span>";
+  }
+  html += "</td></tr></table>";
+
+  // ── Current Sensors
+  html += "<h3>Current Sensors</h3>"
+          "<table><tr><th>Channel</th><th>Current</th><th>Alert</th></tr>";
+  for (int i = 0; i < 8; i++) {
+    bool avail = (i < 4) ? ads0_ok : ads1_ok;
+    html += "<tr><td>SENSE_";
+    html += (char)('0' + i);
+    html += "</td><td>";
+    if (avail) {
+      snprintf(buf, sizeof(buf), "%d mA", currentMa[i]);
+      html += buf;
+    } else {
+      html += "<span class='err'>N/A</span>";
+    }
+    html += "</td><td>";
+    html += (avail && currentAlert[i]) ? "<span class='warn'>ALERT</span>"
+                                       : "<span class='dim'>&mdash;</span>";
+    html += "</td></tr>";
+  }
+  html += "</table>";
+
+  // ── CAN RX Snapshot (latest packet per ID)
+  html += "<h3>CAN RX Snapshot</h3>"
+          "<p class='dim'>One row per CAN ID (latest packet only), sorted by ID.</p>"
+          "<table><tr><th>ID</th><th>DLC</th><th>Latest Data (hex)</th><th>Age</th></tr>";
+
+  // Build a sorted view of used slots by CAN ID (ascending)
+  int rxIdx[CAN_RX_LOG_SIZE];
+  int rxCount = 0;
+  for (int i = 0; i < CAN_RX_LOG_SIZE; i++) {
+    if (canRxLog[i].used) rxIdx[rxCount++] = i;
+  }
+  for (int i = 0; i < rxCount - 1; i++) {
+    for (int j = i + 1; j < rxCount; j++) {
+      if (canRxLog[rxIdx[j]].id < canRxLog[rxIdx[i]].id) {
+        int t = rxIdx[i];
+        rxIdx[i] = rxIdx[j];
+        rxIdx[j] = t;
+      }
+    }
+  }
+
+  bool anyRx = false;
+  for (int n = 0; n < rxCount; n++) {
+    int i = rxIdx[n];
+    anyRx = true;
+    snprintf(buf, sizeof(buf), "0x%03lX", (unsigned long)canRxLog[i].id);
+    html += "<tr><td>";
+    html += buf;
+    html += "</td><td>";
+    html += canRxLog[i].dlc;
+    html += "</td><td>";
+    for (int d = 0; d < canRxLog[i].dlc && d < 8; d++) {
+      snprintf(buf, sizeof(buf), "%02X ", canRxLog[i].data[d]);
+      html += buf;
+    }
+    html += "</td><td>";
+    uint32_t age = now - canRxLog[i].lastMs;
+    if (age < 10000UL) snprintf(buf, sizeof(buf), "%lu ms", age);
+    else               snprintf(buf, sizeof(buf), "%lu s",  age / 1000UL);
+    html += buf;
+    html += "</td></tr>";
+  }
+  if (!anyRx) {
+    html += "<tr><td colspan='4'><span class='dim'>No messages received yet</span></td></tr>";
+  }
+  html += "</table>";
+
+  // ── Footer
+  snprintf(buf, sizeof(buf), "%lu s", now / 1000UL);
+  html += "<p class='dim'>Uptime: ";
+  html += buf;
+  html += " &nbsp;|&nbsp; MCP=";
+  html += mcp_ok  ? "OK" : "<span class='err'>ERR</span>";
+  html += " ADS0=";
+  html += ads0_ok ? "OK" : "<span class='err'>ERR</span>";
+  html += " ADS1=";
+  html += ads1_ok ? "OK" : "<span class='err'>ERR</span>";
+  html += " VEML=";
+  html += veml_ok ? "OK" : "<span class='err'>ERR</span>";
+  html += " &nbsp;|&nbsp; Auto-refresh 2s</p></body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+
+  if (!WiFi.config(WIFI_LOCAL_IP, WIFI_GATEWAY, WIFI_SUBNET, WIFI_GATEWAY, WIFI_GATEWAY)) {
+    Serial.println("[WiFi] Failed to set static IP config");
+  }
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("[WiFi] Connecting to AP \"%s\"...\n", WIFI_SSID);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(200);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WiFi] Connected, local IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("[WiFi] Connect timeout; dashboard may be unavailable until AP is reachable");
+  }
+
+  webServer.on("/", handleRoot);
+  webServer.on("/toggle", handleToggleOutput);
+  webServer.on("/auto", handleAutoOutput);
+  webServer.on("/auto_all", handleAutoAllOutputs);
+  webServer.begin();
+  Serial.println("[WiFi] HTTP server listening on port 80 (STA mode)");
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  SERIAL DIAGNOSTICS — periodic print
 // ═══════════════════════════════════════════════════════════════════
 uint32_t lastDiagMs = 0;
@@ -868,6 +1221,7 @@ void setup() {
   setupVEML();
   setupNeoPixel();
   sonarInit();
+  setupWiFi();
 
   Serial.println("[BOOT] Ready.\n");
 }
@@ -890,6 +1244,9 @@ void loop() {
 
   // 4. DIAGNOSTICS — periodic serial print
   printDiagnostics();
+
+  // 5. WI-FI — serve pending HTTP clients
+  webServer.handleClient();
 
   // Minimal yield
   delay(1);
