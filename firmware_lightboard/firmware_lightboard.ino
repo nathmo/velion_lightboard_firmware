@@ -1,14 +1,23 @@
 /*
- * Velion Lightboard Firmware — Universal (Front / Rear)
+ * Velion Lightboard Firmware
+ * ESP32-C3 + MCP23017 + ADS1115 x2 + VEML7700 + WS2812 + CAN (TWAI)
  *
- * Single firmware for both boards. All MOSFET gate mappings, CAN signal
- * sources, button config, WiFi SSID, and 0x5FF broadcast are configurable
- * via the on-board WiFi AP web interface and persisted in NVS.
+ * Architecture (same as mainboard):
+ *   1. INPUT  — read CAN RX, ADC current sensors, ambient light, sonar echo
+ *   2. EVENT  — generate discrete events from input state changes
+ *   3. FSM    — step each state machine with current events
+ *   4. OUTPUT — apply FSM states to HW (MOSFETs via MCP23017, C AN TX)
  *
- * Hardware: ESP32-C3 + MCP23017 + ADS1115 x2 + VEML7700 + CAN (TWAI)
+ * Compile-time flag IS_FRONT_BOARD selects front vs rear pin/CAN mapping.
+ *
+ * Libraries (install via Arduino Library Manager):
+ *   - Adafruit MCP23X17
+ *   - Adafruit NeoPixel
+ *   - Adafruit ADS1X15
+ *   - Adafruit VEML7700
+ *   - ESP32 board package v2.0.18 (includes driver/twai.h)
  */
 
-#include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -19,1029 +28,1203 @@
 #include "driver/twai.h"
 #include <stdarg.h>
 
-// ── ESP32-C3 pin assignments ────────────────────────────────────────
-static const gpio_num_t PIN_CAN_TX = GPIO_NUM_5;
-static const gpio_num_t PIN_CAN_RX = GPIO_NUM_6;
-static const uint8_t PIN_CAN_S  = 7;
-static const uint8_t PIN_SDA    = 3;
-static const uint8_t PIN_SCL    = 4;
-
-// MCP23017 gate index 0..7 → MCP pin
-static const uint8_t kGateToMcpPin[8] = {15, 14, 13, 12, 11, 10, 9, 8};
-
-// ── CAN IDs ─────────────────────────────────────────────────────────
-static const uint16_t CAN_ID_LIGHT_CONTROL    = 0x400;
-static const uint16_t CAN_ID_FILOVELOX_RAW    = 0x405;
-static const uint16_t CAN_ID_THROTTLE         = 0x407;
-static const uint16_t CAN_ID_LYNX_STATUS      = 0x600;
-static const uint16_t CAN_ID_SILIXCON_CONTROL = 0x5FF;
-
-// ── Timing constants ────────────────────────────────────────────────
-static const uint32_t CAN_5FF_INTERVAL_MS            = 50;
-static const uint32_t THROTTLE_STALE_MS               = 500;
-static const uint32_t CONTROL_STALE_MS                 = 1000;
-static const uint32_t CAN_LOSS_TIMEOUT_MS              = 10000;
-static const uint32_t CAN_LOSS_BLINK_HALF_PERIOD_MS    = 500;
-static const uint32_t BUTTON_LONG_PRESS_MS             = 1000;
-static const uint16_t THROTTLE_MAX_LEVEL               = 32500;
-
-// ── Output function enum ────────────────────────────────────────────
-enum OutputFunction : uint8_t {
-  FUNC_OFF = 0,  FUNC_ON,  FUNC_BRAKE,  FUNC_DRL,
-  FUNC_LEFT,  FUNC_RIGHT,  FUNC_HORN,  FUNC_FOG,
-  FUNC_DRIVING,  FUNC_PASSING,  FUNC_TAIL,  FUNC_REVERSE,
-  FUNC_HAZARD,  FUNC_TAIL_BRAKE,
-  FUNC_MAX = FUNC_TAIL_BRAKE
+// ── Type definitions placed here so Arduino's auto-generated function
+// ── prototypes (injected after the last #include) can see these types.
+enum SonarState : uint8_t {
+  SONAR_IDLE,
+  SONAR_EXCITING,
+  SONAR_LISTENING,
+  SONAR_DONE
 };
 
-static const char* kOutputFunctionNames[] = {
-  "OFF","ON","BRAKE","DRL","LEFT_BLINK","RIGHT_BLINK",
-  "HORN","FOG","DRIVING","PASSING","TAIL","REVERSE","HAZARD","TAIL_BRAKE"
+struct SonarChannel {
+  uint8_t     echoPin;
+  uint8_t     enPinX;
+  uint8_t     enPinY;
+  SonarState  state;
+  uint32_t    exciteStartUs;
+  uint32_t    listenStartUs;
+  uint8_t     distanceCm;     // 0=error, 255=no object, 1-254=cm
+  float       goertzelQ0;
+  float       goertzelQ1;
+  float       goertzelQ2;
+  uint16_t    sampleCount;
+  bool        echoDetected;
+  uint32_t    echoTimeUs;
 };
 
-// ── Command signal enum ─────────────────────────────────────────────
-enum CommandSignal : uint8_t {
-  SIG_PASSING = 0, SIG_DRIVING, SIG_LEFT, SIG_RIGHT,
-  SIG_HORN, SIG_BRAKE, SIG_TAIL, SIG_DRL, SIG_FOG,
-  SIG_MAX = SIG_FOG
+// ═══════════════════════════════════════════════════════════════════
+//  BOARD SELECTION — set to true for front, false for rear
+// ═══════════════════════════════════════════════════════════════════
+#define IS_FRONT_BOARD  true
+
+// ═══════════════════════════════════════════════════════════════════
+//  PIN DEFINITIONS (ESP32-C3)
+// ═══════════════════════════════════════════════════════════════════
+#define PIN_SONAR_ECHO_A      0
+#define PIN_SONAR_ECHO_B      1
+#define PIN_SONAR_ECHO_C      2
+#define PIN_SDA               3
+#define PIN_SCL               4
+#define PIN_CAN_TX            GPIO_NUM_5
+#define PIN_CAN_RX            GPIO_NUM_6
+#define PIN_CAN_S             7     // TJA1051T-3 standby control
+#define PIN_RGBLED_DIN        8
+#define PIN_PIEZO_PWM_HALF_X  9
+#define PIN_PIEZO_PWM_HALF_Y  10
+
+// ═══════════════════════════════════════════════════════════════════
+//  MCP23017 (0x20) PIN ALIASES
+//  GPA0-GPA7 = 0-7,   GPB0-GPB7 = 8-15
+// ═══════════════════════════════════════════════════════════════════
+// GPB — MOSFET gates (active HIGH)
+#define MCP_MOSFET_GATE_7   8   // GPB0
+#define MCP_MOSFET_GATE_6   9   // GPB1
+#define MCP_MOSFET_GATE_5  10   // GPB2
+#define MCP_MOSFET_GATE_4  11   // GPB3
+#define MCP_MOSFET_GATE_3  12   // GPB4
+#define MCP_MOSFET_GATE_2  13   // GPB5
+#define MCP_MOSFET_GATE_1  14   // GPB6
+#define MCP_MOSFET_GATE_0  15   // GPB7
+
+// GPA — Piezo half-H bridge enables
+#define MCP_EN_PIEZO_A_X    0   // GPA0
+#define MCP_EN_PIEZO_B_X    1   // GPA1
+#define MCP_EN_PIEZO_C_X    2   // GPA2
+#define MCP_EN_PIEZO_A_Y    3   // GPA3
+#define MCP_EN_PIEZO_B_Y    4   // GPA4
+#define MCP_EN_PIEZO_C_Y    5   // GPA5
+
+// ═══════════════════════════════════════════════════════════════════
+//  CAN CONTROL BIT MAPPING (from 0x400, 2-byte LE)
+// ═══════════════════════════════════════════════════════════════════
+#define BIT_DRL          0   // frontboard only (daylight)
+#define BIT_LOW_BEAM     1   // frontboard only — edge-driven smart light
+#define BIT_HIGH_BEAM    2   // frontboard only — edge-driven smart light
+#define BIT_LEFT_BLINK   3
+#define BIT_RIGHT_BLINK  4
+#define BIT_TAIL         5   // rearboard only
+#define BIT_BRAKE        6   // rearboard only
+#define BIT_HORN         7   // frontboard only
+#define BIT_REVERSE      8   // rearboard only
+#define BIT_FOG          9   // rearboard only
+#define BIT_FLASH       10   // rearboard only
+
+// ═══════════════════════════════════════════════════════════════════
+//  CAN IDs
+// ═══════════════════════════════════════════════════════════════════
+#define CAN_ID_LIGHT_CONTROL    0x400
+#define CAN_ID_SET_THRESHOLD    0x121
+
+// Output CAN base IDs (rear / front)
+#if IS_FRONT_BOARD
+  #define CAN_BASE_OUT  0x491
+#else
+  #define CAN_BASE_OUT  0x481
+#endif
+
+#define CAN_ID_MOSFET_STATUS    (CAN_BASE_OUT + 0)   // 0x491/0x481
+#define CAN_ID_THRESHOLD_RPT    (CAN_BASE_OUT + 1)   // 0x492/0x482
+#define CAN_ID_CURRENT_CH0      (CAN_BASE_OUT + 2)   // +2..+9 for ch 0-7
+#define CAN_ID_PROXIMITY        (CAN_BASE_OUT + 10)   // 0x49B/0x48B
+#define CAN_ID_AMBIENT          (CAN_BASE_OUT + 11)   // 0x49C/0x48C
+
+// ═══════════════════════════════════════════════════════════════════
+//  MOSFET GATE LOOKUP — maps control bit index → MCP pin
+//  -1 = not applicable on this board variant
+// ═══════════════════════════════════════════════════════════════════
+#if IS_FRONT_BOARD
+  // Bit: 0=DRL→G0, 1=LowBeam→G1(smart), 2=HiBeam→G1(smart),
+  //      3=Lblink→G2, 4=Rblink→G3, 5=N/A, 6=N/A, 7=horn→G4
+  static const int8_t bitToMosfetPin[11] = {
+    MCP_MOSFET_GATE_0,  // 0  DRL
+    -1,                  // 1  low beam  (handled by smart light FSM)
+    -1,                  // 2  high beam (handled by smart light FSM)
+    MCP_MOSFET_GATE_2,  // 3  left blinker
+    MCP_MOSFET_GATE_3,  // 4  right blinker
+    -1,                  // 5  tail (rear only)
+    -1,                  // 6  brake (rear only)
+    MCP_MOSFET_GATE_4,  // 7  horn
+    -1,                  // 8  reverse (rear only)
+    -1,                  // 9  fog     (rear only)
+    -1                   // 10 flash   (rear only)
+  };
+#else
+  // Rear: 0=N/A, 1=N/A, 2=N/A, 3=Lblink→G2, 4=Rblink→G3,
+  //       5=tail→G0, 6=brake→G1, 7=N/A, 8=reverse→G5, 9=fog→G6, 10=flash→G7
+  static const int8_t bitToMosfetPin[11] = {
+    -1,                  // 0  DRL (front only)
+    -1,                  // 1  low beam  (front only)
+    -1,                  // 2  high beam (front only)
+    MCP_MOSFET_GATE_2,  // 3  left blinker
+    MCP_MOSFET_GATE_3,  // 4  right blinker
+    MCP_MOSFET_GATE_0,  // 5  tail
+    MCP_MOSFET_GATE_1,  // 6  brake
+    -1,                  // 7  horn (front only)
+    MCP_MOSFET_GATE_5,  // 8  reverse
+    MCP_MOSFET_GATE_6,  // 9  fog
+    MCP_MOSFET_GATE_7   // 10 flash
+  };
+#endif
+
+// ═══════════════════════════════════════════════════════════════════
+//  SMART LIGHT FSM (front board only) — DRL / Low / High beam
+//  The physical lamp has an edge-triggered controller:
+//    BOOT → DRL only
+//    rising edge → Low Beam
+//    rising edge → High Beam
+//    rising edge → Low Beam  (cycles between low/high)
+//
+//  We track the lamp's internal state and send edges on MOSFET_GATE_1
+//  to navigate to the desired CAN-commanded state.
+//  Max 1 edge per second.
+// ═══════════════════════════════════════════════════════════════════
+enum SmartLightState : uint8_t {
+  SL_DRL = 0,
+  SL_LOW_BEAM,
+  SL_HIGH_BEAM
 };
 
-static const char* kCommandSignalNames[] = {
-  "PASSING","DRIVING","LEFT_BLINK","RIGHT_BLINK","HORN","BRAKE","TAIL","DRL","FOG"
-};
+SmartLightState slCurrent  = SL_DRL;    // what the lamp is currently in
+SmartLightState slDesired  = SL_DRL;    // what CAN commands want
+bool     slEdgeActive      = false;     // currently pulsing the MOSFET
+uint32_t slLastEdgeMs      = 0;         // time of last rising edge
+#define  SL_EDGE_MIN_MS    1000         // min 1 s between edges
+#define  SL_PULSE_MS       80           // pulse width for edge
 
-// ── CAN-to-signal mapping ───────────────────────────────────────────
-struct CanSignalMap {
-  uint16_t canId;
-  uint8_t  bit;
-};
-
-// Defaults (user-editable via web, persisted in NVS)
-static const CanSignalMap kDefaultSignalMap[SIG_MAX + 1] = {
-  {CAN_ID_LIGHT_CONTROL, 1},   // SIG_PASSING  — 0x400 bit 1
-  {CAN_ID_FILOVELOX_RAW, 4},   // SIG_DRIVING  — 0x405 bit 4 (sw1)
-  {CAN_ID_LIGHT_CONTROL, 3},   // SIG_LEFT     — 0x400 bit 3
-  {CAN_ID_LIGHT_CONTROL, 4},   // SIG_RIGHT    — 0x400 bit 4
-  {CAN_ID_LIGHT_CONTROL, 7},   // SIG_HORN     — 0x400 bit 7
-  {CAN_ID_FILOVELOX_RAW, 7},   // SIG_BRAKE    — 0x405 bit 7
-  {CAN_ID_LIGHT_CONTROL, 5},   // SIG_TAIL     — 0x400 bit 5
-  {CAN_ID_LIGHT_CONTROL, 0},   // SIG_DRL      — 0x400 bit 0
-  {CAN_ID_LIGHT_CONTROL, 6}    // SIG_FOG      — 0x400 bit 6
-};
-
-// Default gate→function maps for front and rear boards
-static const uint8_t kDefaultFrontMap[8] = {
-  FUNC_DRL, FUNC_PASSING, FUNC_LEFT, FUNC_RIGHT,
-  FUNC_HORN, FUNC_ON, FUNC_DRIVING, FUNC_OFF
-};
-static const uint8_t kDefaultRearMap[8] = {
-  FUNC_RIGHT, FUNC_OFF, FUNC_TAIL, FUNC_LEFT,
-  FUNC_OFF, FUNC_BRAKE, FUNC_OFF, FUNC_OFF
-};
-
-// ── Peripheral objects ──────────────────────────────────────────────
-WebServer        webServer(80);
-Preferences      preferences;
+// ═══════════════════════════════════════════════════════════════════
+//  PERIPHERAL OBJECTS
+// ═══════════════════════════════════════════════════════════════════
 Adafruit_MCP23X17 mcp;
-Adafruit_ADS1115  ads48;
-Adafruit_ADS1115  ads49;
+Adafruit_ADS1115  ads0;  // 0x48 — SENSE_0..3
+Adafruit_ADS1115  ads1;  // 0x49 — SENSE_4..7
 Adafruit_VEML7700 veml;
 
-bool mcpOk   = false;
-bool ads48Ok = false;
-bool ads49Ok = false;
-bool vemlOk  = false;
-bool canOk   = false;
+bool mcp_ok  = false;
+bool ads0_ok = false;
+bool ads1_ok = false;
+bool veml_ok = false;
 
-// ── Persistent configuration (loaded from NVS at boot) ──────────────
-char     apSsid[33] = "lightboard_unconfigured";
-char     apPass[33] = "VelionDebug";
-uint8_t  gateFunctionMap[8];
-CanSignalMap signalMap[SIG_MAX + 1];
-uint16_t btnCanId     = CAN_ID_FILOVELOX_RAW;  // long/short press button source
-uint8_t  btnBit       = 3;                      // sw4 = bit 3 of 0x405
-bool     can5ffEnabled = false;
+// ═══════════════════════════════════════════════════════════════════
+//  NeoPixel
+// ═══════════════════════════════════════════════════════════════════
+#define NUM_PIXELS 1
+Adafruit_NeoPixel pixels(NUM_PIXELS, PIN_RGBLED_DIN, NEO_GRB + NEO_KHZ800);
 
-// ── Runtime state ───────────────────────────────────────────────────
-bool webAutoMode = true;
-bool manualGateState[8]      = {};
-bool lastAppliedGateState[8] = {};
+// ═══════════════════════════════════════════════════════════════════
+//  SOFTWARE TIMERS
+// ═══════════════════════════════════════════════════════════════════
+struct SoftTimer {
+  bool     running;
+  uint32_t startMs;
+  uint32_t durationMs;
+};
 
-float   senseCurrentA[8] = {};
-int16_t senseRaw[8]      = {};
-float   luxValue = 0.0f;
-
-uint16_t lightWord      = 0;
-bool     lightWordValid = false;
-uint32_t lastLightWordMs = 0;
-
-uint8_t  throttleByte   = 0;
-bool     throttleValid  = false;
-uint32_t lastThrottleMs = 0;
-
-uint8_t lynxMode       = 0;
-uint8_t currentPowerMap = 0;
-
-// Decoded command signals
-bool cmdPassing   = false;
-bool cmdDriving   = false;
-bool cmdLeftBlink = false;
-bool cmdRightBlink= false;
-bool cmdHorn      = false;
-bool cmdBrake     = false;
-bool cmdTail      = false;
-bool cmdDrl       = false;
-bool cmdFog       = false;
-uint32_t cmdLastUpdateMs[SIG_MAX + 1] = {};
-bool     signalRawState[SIG_MAX + 1]  = {};
-
-// Button state (long / short press from configurable CAN source)
-bool     buttonPrev         = false;
-uint32_t buttonPressStartMs = 0;
-bool     reverseLatched     = false;
-bool     mappingPulsePending= false;
-
-// 0x5FF TX state
-uint32_t last5ffTxMs   = 0;
-bool     last5ffValid  = false;
-uint8_t  last5ffData[8]= {};
-uint32_t last5ffSentMs = 0;
-
-// Timing
-uint32_t lastSensorReadMs = 0;
-uint32_t lastAnyCanRxMs   = 0;
-
-// CAN frame tracker (for web dashboard)
-static const uint8_t CAN_TRACK_MAX = 64;
-struct CanTrack { bool used; uint32_t id; uint8_t dlc; uint8_t data[8]; uint32_t lastMs; };
-CanTrack canTrack[CAN_TRACK_MAX] = {};
-
-// Serial log ring buffer
-static const uint8_t SERIAL_LOG_MAX = 40;
-String  serialLog[SERIAL_LOG_MAX];
-uint8_t serialLogHead  = 0;
-uint8_t serialLogCount = 0;
-
-// ═════════════════════════════════════════════════════════════════════
-//  HELPERS
-// ═════════════════════════════════════════════════════════════════════
-
-String hexByte(uint8_t b) {
-  const char* d = "0123456789ABCDEF";
-  String s; s.reserve(2);
-  s += d[(b >> 4) & 0x0F];
-  s += d[b & 0x0F];
-  return s;
+void timerStart(SoftTimer &t, uint32_t ms) {
+  t.running    = true;
+  t.startMs    = millis();
+  t.durationMs = ms;
 }
 
-void serialLogPush(const String& line) {
-  serialLog[serialLogHead] = line;
-  serialLogHead = (uint8_t)((serialLogHead + 1) % SERIAL_LOG_MAX);
-  if (serialLogCount < SERIAL_LOG_MAX) serialLogCount++;
-}
+void timerStop(SoftTimer &t) { t.running = false; }
 
-void logLine(const String& line) {
-  Serial.println(line);
-  serialLogPush(line);
-}
-
-void logf(const char* fmt, ...) {
-  char buf[192];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, args);
-  va_end(args);
-  logLine(String(buf));
-}
-
-const char* signalName(uint8_t s) {
-  return (s <= SIG_MAX) ? kCommandSignalNames[s] : "?";
-}
-const char* functionName(uint8_t f) {
-  return (f <= FUNC_MAX) ? kOutputFunctionNames[f] : "?";
-}
-
-const char* lynxModeName(uint8_t mode) {
-  switch (mode) {
-    case   0: return "STOP";          case   2: return "INVALID_INPUTS";
-    case   6: return "BMS_ERROR";     case   9: return "IDENT";
-    case  10: return "INIT";          case  20: return "CAN_TIMEOUT";
-    case  30: return "WELDING";       case  65: return "CHARGE_EXT_FOREVER";
-    case  68: return "CHARGE_EXT";    case  70: return "CHARGE";
-    case  79: return "SLAVE";         case  80: return "OVR";
-    case  90: return "LOCK";          case  95: return "SEAT_SWITCH";
-    case 100: return "STANDBY";       case 101: return "BRAKE";
-    case 102: return "ACCELERATE";    case 104: return "KICKBACK";
-    case 105: return "ASSIST";        case 110: return "CRUISE";
-    case 120: return "DISARMED_FOREVER";
-    default:  return "UNKNOWN";
+bool timerExpired(SoftTimer &t) {
+  if (!t.running) return false;
+  if (millis() - t.startMs >= t.durationMs) {
+    t.running = false;
+    return true;
   }
+  return false;
 }
 
-bool parseUIntArg(const String& key, long minV, long maxV, uint8_t& out) {
-  if (!webServer.hasArg(key)) return false;
-  String s = webServer.arg(key);
-  char* endPtr = NULL;
-  long v = strtol(s.c_str(), &endPtr, 10);
-  if (endPtr == s.c_str() || *endPtr != '\0') return false;
-  if (v < minV || v > maxV) return false;
-  out = (uint8_t)v;
+// ═══════════════════════════════════════════════════════════════════
+//  CAN COMMAND WATCHDOG — 3 s timeout
+// ═══════════════════════════════════════════════════════════════════
+uint32_t lastCanCmdMs      = 0;
+bool     canCmdValid       = false;
+uint16_t canCmdBits        = 0;       // last received 11-bit control word
+uint16_t canCmdBitsPrev    = 0;       // previous cycle (for edge detection)
+#define  CAN_CMD_TIMEOUT_MS 3000
+
+// Manual MOSFET override per CAN control bit.
+// enabled=false -> follow CAN/watchdog behavior
+// enabled=true  -> force output to manual state
+bool manualOverrideEnabled[11] = {false};
+bool manualOverrideState[11]   = {false};
+
+bool isManualControllableBit(int b) {
+  if (b < 0 || b >= 11) return false;
+  return bitToMosfetPin[b] >= 0;
+}
+
+bool parseBitArg(int &bitOut) {
+  if (!webServer.hasArg("bit")) return false;
+  String bitStr = webServer.arg("bit");
+  if (bitStr.length() == 0) return false;
+
+  char *endPtr = NULL;
+  long value = strtol(bitStr.c_str(), &endPtr, 10);
+  if (endPtr == bitStr.c_str() || *endPtr != '\0') return false;
+  if (value < 0 || value >= 11) return false;
+
+  bitOut = (int)value;
   return true;
 }
 
-// ═════════════════════════════════════════════════════════════════════
-//  PERSISTENCE (NVS)
-// ═════════════════════════════════════════════════════════════════════
-
-void savePersistentConfig() {
-  preferences.begin("velion", false);
-  preferences.putString("ssid", String(apSsid));
-  preferences.putString("pass", String(apPass));
-  preferences.putBool("tx5en", can5ffEnabled);
-  preferences.putUShort("btnCid", btnCanId);
-  preferences.putUChar("btnBit", btnBit);
-  for (uint8_t i = 0; i < 8; i++) {
-    char key[4]; snprintf(key, sizeof(key), "m%u", (unsigned)i);
-    preferences.putUChar(key, gateFunctionMap[i]);
-  }
-  for (uint8_t s = 0; s <= SIG_MAX; s++) {
-    char kc[5], kb[5];
-    snprintf(kc, sizeof(kc), "s%uc", (unsigned)s);
-    snprintf(kb, sizeof(kb), "s%ub", (unsigned)s);
-    preferences.putUShort(kc, signalMap[s].canId);
-    preferences.putUChar(kb, signalMap[s].bit);
-  }
-  preferences.end();
+void sendRedirectToRoot() {
+  webServer.sendHeader("Location", "/");
+  webServer.send(303, "text/plain", "");
 }
 
-void loadPersistentConfig() {
-  // Start with compiled-in defaults
-  for (uint8_t i = 0; i < 8; i++) gateFunctionMap[i] = kDefaultFrontMap[i];
-  for (uint8_t s = 0; s <= SIG_MAX; s++) signalMap[s] = kDefaultSignalMap[s];
-
-  preferences.begin("velion", true);
-  String ssid = preferences.getString("ssid", "lightboard_unconfigured");
-  ssid.toCharArray(apSsid, sizeof(apSsid));
-  String pass = preferences.getString("pass", "VelionDebug");
-  pass.toCharArray(apPass, sizeof(apPass));
-  can5ffEnabled = preferences.getBool("tx5en", false);
-  btnCanId = preferences.getUShort("btnCid", CAN_ID_FILOVELOX_RAW);
-  btnBit   = preferences.getUChar("btnBit", 3);
-  for (uint8_t i = 0; i < 8; i++) {
-    char key[4]; snprintf(key, sizeof(key), "m%u", (unsigned)i);
-    uint8_t v = preferences.getUChar(key, gateFunctionMap[i]);
-    gateFunctionMap[i] = (v <= FUNC_MAX) ? v : kDefaultFrontMap[i];
-  }
-  for (uint8_t s = 0; s <= SIG_MAX; s++) {
-    char kc[5], kb[5];
-    snprintf(kc, sizeof(kc), "s%uc", (unsigned)s);
-    snprintf(kb, sizeof(kb), "s%ub", (unsigned)s);
-    signalMap[s].canId = preferences.getUShort(kc, kDefaultSignalMap[s].canId);
-    signalMap[s].bit   = preferences.getUChar(kb, kDefaultSignalMap[s].bit);
-  }
-  preferences.end();
-}
-
-// ═════════════════════════════════════════════════════════════════════
-//  MCP23017 — MOSFET GATE DRIVER
-// ═════════════════════════════════════════════════════════════════════
-
-void mcpWriteGate(uint8_t gate, bool on) {
-  if (!mcpOk || gate > 7) return;
-  if (on == lastAppliedGateState[gate]) return;   // ← FIX (a): skip I2C if no change
-  mcp.digitalWrite(kGateToMcpPin[gate], on ? HIGH : LOW);
-  lastAppliedGateState[gate] = on;
-}
-
-// ═════════════════════════════════════════════════════════════════════
-//  CAN FRAME TRACKER (for web dashboard)
-// ═════════════════════════════════════════════════════════════════════
-
-void trackCan(const twai_message_t& msg) {
-  int slot = -1, freeSlot = -1, oldest = 0;
-  uint32_t oldestMs = UINT32_MAX;
-  for (int i = 0; i < CAN_TRACK_MAX; i++) {
-    if (canTrack[i].used && canTrack[i].id == msg.identifier) { slot = i; break; }
-    if (!canTrack[i].used && freeSlot < 0) freeSlot = i;
-    if (canTrack[i].lastMs < oldestMs) { oldestMs = canTrack[i].lastMs; oldest = i; }
-  }
-  if (slot < 0) slot = (freeSlot >= 0) ? freeSlot : oldest;
-  canTrack[slot].used = true;
-  canTrack[slot].id   = msg.identifier;
-  canTrack[slot].dlc  = msg.data_length_code;
-  uint8_t n = msg.data_length_code; if (n > 8) n = 8;
-  for (uint8_t i = 0; i < n; i++) canTrack[slot].data[i] = msg.data[i];
-  for (uint8_t i = n; i < 8; i++) canTrack[slot].data[i] = 0;
-  canTrack[slot].lastMs = millis();
-}
-
-// ═════════════════════════════════════════════════════════════════════
-//  SIGNAL DECODING + BUTTON HANDLING
-// ═════════════════════════════════════════════════════════════════════
-
-void setSignalState(uint8_t signal, bool state) {
-  switch (signal) {
-    case SIG_PASSING: cmdPassing   = state; break;
-    case SIG_DRIVING: cmdDriving   = state; break;
-    case SIG_LEFT:    cmdLeftBlink = state; break;
-    case SIG_RIGHT:   cmdRightBlink= state; break;
-    case SIG_HORN:    cmdHorn      = state; break;
-    case SIG_BRAKE:   cmdBrake     = state; break;
-    case SIG_TAIL:    cmdTail      = state; break;
-    case SIG_DRL:     cmdDrl       = state; break;
-    case SIG_FOG:     cmdFog       = state; break;
-  }
-}
-
-void decodeMappedSignalsFromCan(const twai_message_t& msg) {
-  uint8_t dlc = msg.data_length_code;
-  if (dlc == 0) return;
-  if (dlc > 8) dlc = 8;
-
-  uint16_t word = msg.data[0];
-  if (dlc >= 2) word |= (uint16_t)(msg.data[1] << 8);
-
-  uint32_t now = millis();
-
-  // Update each mapped signal that listens to this CAN ID
-  for (uint8_t s = 0; s <= SIG_MAX; s++) {
-    if (signalMap[s].canId != msg.identifier) continue;
-    uint8_t bit = signalMap[s].bit;
-    if (bit / 8 >= dlc || bit > 15) continue;
-    bool state = ((word >> bit) & 0x01) != 0;
-    signalRawState[s] = state;
-    setSignalState(s, state);
-    cmdLastUpdateMs[s] = now;
-  }
-
-  // ── Button handling (configurable CAN source) ── FIX (b)
-  // Long press  → toggle reverse latch (ignore short presses while latched)
-  // Short press → one-shot mapping pulse in next 0x5FF
-  if (msg.identifier == btnCanId && btnCanId != 0xFFFF) {
-    uint8_t byteIdx = btnBit / 8;
-    if (byteIdx < dlc && btnBit <= 15) {
-      bool buttonNow = ((word >> btnBit) & 0x01) != 0;
-
-      if (buttonNow && !buttonPrev) {
-        // Rising edge — record press start
-        buttonPressStartMs = now;
-      }
-
-      if (!buttonNow && buttonPrev) {
-        // Falling edge — classify as short or long press
-        uint32_t heldMs = now - buttonPressStartMs;
-        if (heldMs >= BUTTON_LONG_PRESS_MS) {
-          reverseLatched = !reverseLatched;
-          logf("[BTN] long press -> reverse=%d", reverseLatched ? 1 : 0);
-        } else if (!reverseLatched) {
-          mappingPulsePending = true;
-          logf("[BTN] short press -> mapping pulse");
-        }
-        // Short presses while reverseLatched are silently ignored.
-      }
-
-      buttonPrev = buttonNow;
-    }
-  }
-}
-
-// ═════════════════════════════════════════════════════════════════════
-//  CAN RX
-// ═════════════════════════════════════════════════════════════════════
-
-void readCAN() {
-  if (!canOk) return;
-  twai_message_t msg;
-  while (twai_receive(&msg, 0) == ESP_OK) {
-    lastAnyCanRxMs = millis();
-    trackCan(msg);
-
-    if (msg.identifier == CAN_ID_LIGHT_CONTROL && msg.data_length_code >= 1) {
-      lightWord = (uint16_t)(msg.data[0]);
-      if (msg.data_length_code >= 2) lightWord |= (uint16_t)(msg.data[1] << 8);
-      lightWordValid  = true;
-      lastLightWordMs = millis();
-    }
-
-    decodeMappedSignalsFromCan(msg);
-
-    if (msg.identifier == CAN_ID_THROTTLE && msg.data_length_code >= 1) {
-      throttleByte = msg.data[0];
-      throttleValid  = true;
-      lastThrottleMs = millis();
-    } else if (msg.identifier == CAN_ID_LYNX_STATUS && msg.data_length_code >= 3) {
-      lynxMode       = msg.data[1];
-      currentPowerMap = msg.data[2];
-    }
-  }
-}
-
-void applyInputTimeouts() {
-  uint32_t now = millis();
-  if (throttleValid && (now - lastThrottleMs > THROTTLE_STALE_MS))
-    throttleValid = false;
-  if (lightWordValid && (now - lastLightWordMs > CONTROL_STALE_MS))
-    lightWordValid = false;
-
-  for (uint8_t s = 0; s <= SIG_MAX; s++) {
-    if (cmdLastUpdateMs[s] == 0) continue;
-    if (now - cmdLastUpdateMs[s] > CONTROL_STALE_MS) {
-      signalRawState[s] = false;
-      setSignalState(s, false);
-      cmdLastUpdateMs[s] = 0;
-    }
-  }
-}
-
-// ═════════════════════════════════════════════════════════════════════
-//  OUTPUT STAGE
-// ═════════════════════════════════════════════════════════════════════
-
-bool outputFunctionState(uint8_t fn) {
-  switch (fn) {
-    case FUNC_OFF:        return false;
-    case FUNC_ON:         return true;
-    case FUNC_BRAKE:      return cmdBrake;
-    case FUNC_DRL:        return cmdDrl;
-    case FUNC_LEFT:       return cmdLeftBlink;
-    case FUNC_RIGHT:      return cmdRightBlink;
-    case FUNC_HORN:       return cmdHorn;
-    case FUNC_FOG:        return cmdFog;
-    case FUNC_DRIVING:    return cmdDriving;
-    case FUNC_PASSING:    return cmdPassing;
-    case FUNC_TAIL:       return cmdTail;
-    case FUNC_REVERSE:    return reverseLatched;
-    case FUNC_HAZARD:     return cmdLeftBlink || cmdRightBlink;
-    case FUNC_TAIL_BRAKE: return cmdTail || cmdBrake;
-    default:              return false;
-  }
-}
-
-void applyOutputs() {
-  if (!mcpOk) return;
-
-  uint32_t now = millis();
-
-  // CAN-loss safety: blink all outputs
-  bool canLost = (now - lastAnyCanRxMs) >= CAN_LOSS_TIMEOUT_MS;
-  if (canLost) {
-    bool allOn = ((now / CAN_LOSS_BLINK_HALF_PERIOD_MS) % 2U) == 0U;
-    for (uint8_t i = 0; i < 8; i++) mcpWriteGate(i, allOn);
+void handleToggleOutput() {
+  int bit = -1;
+  if (!parseBitArg(bit) || !isManualControllableBit(bit)) {
+    webServer.send(400, "text/plain", "Invalid output bit");
     return;
   }
 
-  if (webAutoMode) {
-    for (uint8_t i = 0; i < 8; i++)
-      mcpWriteGate(i, outputFunctionState(gateFunctionMap[i]));
-  } else {
-    for (uint8_t i = 0; i < 8; i++)
-      mcpWriteGate(i, manualGateState[i]);
+  manualOverrideEnabled[bit] = true;
+  manualOverrideState[bit] = !manualOverrideState[bit];
+  sendRedirectToRoot();
+}
+
+void handleAutoOutput() {
+  int bit = -1;
+  if (!parseBitArg(bit) || !isManualControllableBit(bit)) {
+    webServer.send(400, "text/plain", "Invalid output bit");
+    return;
+  }
+
+  manualOverrideEnabled[bit] = false;
+  sendRedirectToRoot();
+}
+
+void handleAutoAllOutputs() {
+  for (int b = 0; b < 11; b++) {
+    manualOverrideEnabled[b] = false;
+  }
+  sendRedirectToRoot();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CAN RX LOG — stores latest payload for each unique received ID
+// ═══════════════════════════════════════════════════════════════════
+#define CAN_RX_LOG_SIZE  12
+
+struct CanRxRecord {
+  uint32_t id;
+  uint8_t  dlc;
+  uint8_t  data[8];
+  uint32_t lastMs;
+  bool     used;
+};
+
+CanRxRecord canRxLog[CAN_RX_LOG_SIZE] = {};
+
+// ═══════════════════════════════════════════════════════════════════
+//  WIFI HOTSPOT & WEB SERVER CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════
+#define WIFI_SSID     "Velion-Dashboard"
+#define WIFI_PASSWORD "velion1234"
+
+// Front/rear boards join the mainboard AP using fixed IPs.
+const IPAddress WIFI_GATEWAY(192, 168, 4, 1);
+const IPAddress WIFI_SUBNET(255, 255, 255, 0);
+
+#if IS_FRONT_BOARD
+const IPAddress WIFI_LOCAL_IP(192, 168, 4, 2);
+#else
+const IPAddress WIFI_LOCAL_IP(192, 168, 4, 3);
+#endif
+
+// HTTP dashboard server (served from each lightboard)
+WebServer webServer(80);
+
+// ═══════════════════════════════════════════════════════════════════
+//  CURRENT SENSE (ADS1115)
+//  Each ADC channel measures voltage across a 1 mΩ shunt to GND.
+//  ADS1115 in single-ended mode gives voltage in mV;
+//  I = V / R = V_uV / 1000  → mA  (since R = 0.001 Ω, I_mA = V_mV)
+//  At gain=16 (±0.256V), LSB = 0.0078125 mV → resolution ~7.8 µA
+// ═══════════════════════════════════════════════════════════════════
+int16_t  currentMa[8]          = {0};    // latest current in mA per channel
+int16_t  thresholdLowMa[8]     = {0};    // 0 = disabled
+int16_t  thresholdHighMa[8]    = {0};    // 0 = disabled
+bool     currentAlert[8]       = {false};
+
+// ADS1115 channel order:  ads0: AIN0=SENSE_3, AIN1=SENSE_2, AIN2=SENSE_1, AIN3=SENSE_0
+//                         ads1: AIN0=SENSE_7, AIN1=SENSE_6, AIN2=SENSE_5, AIN3=SENSE_4
+// Map sense index (0-7) → {ads pointer, ads channel}
+struct AdsChanMap {
+  Adafruit_ADS1115* ads;
+  uint8_t           chan;
+  bool*             ok;
+};
+
+AdsChanMap adsChanMap[8]; // filled in setup
+
+// Timing for round-robin ADC reading
+uint8_t  adsNextChan     = 0;
+uint32_t lastAdsReadMs   = 0;
+#define  ADS_READ_INTERVAL_MS 2   // ~2 ms per channel → all 8 in ~16 ms
+
+// ═══════════════════════════════════════════════════════════════════
+//  AMBIENT LIGHT (VEML7700)
+// ═══════════════════════════════════════════════════════════════════
+float    ambientLux      = 0.0f;
+uint32_t lastVemlReadMs  = 0;
+#define  VEML_READ_INTERVAL_MS 200
+
+// ═══════════════════════════════════════════════════════════════════
+//  SONAR — Piezo ultrasonic (40 kHz Goertzel)
+//  HARDWARE BUG: excitation disabled. Code present but commented out.
+// ═══════════════════════════════════════════════════════════════════
+#define SONAR_CHANNELS      3
+#define SONAR_SAMPLE_RATE   80000   // 80 kHz sampling (2x Nyquist for 40 kHz)
+#define SONAR_TARGET_FREQ   40000   // 40 kHz
+#define SONAR_BLOCK_SIZE    64      // samples per Goertzel block
+#define SONAR_EXCITE_CYCLES 8       // number of 40 kHz cycles to transmit
+#define SONAR_MAX_RANGE_CM  254
+#define SONAR_SPEED_OF_SOUND_CM_US 0.0343f  // cm per µs
+
+// Goertzel coefficient for 40 kHz at 80 kHz sample rate
+// k = round(N * f_target / f_sample) = round(64 * 40000 / 80000) = 32
+// coeff = 2*cos(2*PI*k/N) = 2*cos(2*PI*32/64) = 2*cos(PI) = -2.0
+static const float GOERTZEL_COEFF = -2.0f;
+
+SonarChannel sonar[SONAR_CHANNELS];
+uint8_t      sonarActiveCh = 0;
+uint32_t     lastSonarCycleMs = 0;
+#define      SONAR_CYCLE_MS   50
+
+void sonarInit() {
+  sonar[0] = { PIN_SONAR_ECHO_A, MCP_EN_PIEZO_A_X, MCP_EN_PIEZO_A_Y,
+               SONAR_IDLE, 0, 0, 255, 0, 0, 0, 0, false, 0 };
+  sonar[1] = { PIN_SONAR_ECHO_B, MCP_EN_PIEZO_B_X, MCP_EN_PIEZO_B_Y,
+               SONAR_IDLE, 0, 0, 255, 0, 0, 0, 0, false, 0 };
+  sonar[2] = { PIN_SONAR_ECHO_C, MCP_EN_PIEZO_C_X, MCP_EN_PIEZO_C_Y,
+               SONAR_IDLE, 0, 0, 255, 0, 0, 0, 0, false, 0 };
+}
+
+// Start excitation for a sonar channel  (DISABLED — HW bug)
+void sonarStartExcite(uint8_t ch) {
+  if (!mcp_ok) return;
+  SonarChannel &s = sonar[ch];
+
+  // Enable both half-H bridges
+  // *** DISABLED: HW bug — cannot independently control X/Y per channel ***
+  // mcp.digitalWrite(s.enPinX, HIGH);
+  // mcp.digitalWrite(s.enPinY, HIGH);
+
+  s.state = SONAR_EXCITING;
+  s.exciteStartUs = micros();
+  s.echoDetected = false;
+  s.goertzelQ0 = 0;
+  s.goertzelQ1 = 0;
+  s.goertzelQ2 = 0;
+  s.sampleCount = 0;
+
+  // Start 40 kHz PWM on both half-bridge pins (complementary)
+  // *** DISABLED: HW bug ***
+  // ledcSetup(0, SONAR_TARGET_FREQ, 1);  // 1-bit resolution → 50% duty
+  // ledcAttachPin(PIN_PIEZO_PWM_HALF_X, 0);
+  // ledcSetup(1, SONAR_TARGET_FREQ, 1);
+  // ledcAttachPin(PIN_PIEZO_PWM_HALF_Y, 1);
+  // ledcWrite(0, 1);
+  // ledcWrite(1, 0);  // complementary
+}
+
+// Stop excitation, switch to listening mode  (DISABLED — HW bug)
+void sonarStartListen(uint8_t ch) {
+  SonarChannel &s = sonar[ch];
+
+  // Stop PWM
+  // *** DISABLED: HW bug ***
+  // ledcDetachPin(PIN_PIEZO_PWM_HALF_X);
+  // ledcDetachPin(PIN_PIEZO_PWM_HALF_Y);
+  // digitalWrite(PIN_PIEZO_PWM_HALF_X, LOW);
+  // digitalWrite(PIN_PIEZO_PWM_HALF_Y, LOW);
+
+  // Disable half-H bridges → High-Z for listening
+  // *** DISABLED: HW bug ***
+  // if (mcp_ok) {
+  //   mcp.digitalWrite(s.enPinX, LOW);
+  //   mcp.digitalWrite(s.enPinY, LOW);
+  // }
+
+  s.state = SONAR_LISTENING;
+  s.listenStartUs = micros();
+  s.goertzelQ0 = 0;
+  s.goertzelQ1 = 0;
+  s.goertzelQ2 = 0;
+  s.sampleCount = 0;
+}
+
+// Goertzel filter: feed one sample, check for echo threshold
+// Returns magnitude² of 40 kHz component when block is complete
+float sonarGoertzelProcess(SonarChannel &s, float sample) {
+  s.goertzelQ0 = GOERTZEL_COEFF * s.goertzelQ1 - s.goertzelQ2 + sample;
+  s.goertzelQ2 = s.goertzelQ1;
+  s.goertzelQ1 = s.goertzelQ0;
+  s.sampleCount++;
+
+  if (s.sampleCount >= SONAR_BLOCK_SIZE) {
+    // Compute magnitude² = q1² + q2² - coeff*q1*q2
+    float mag2 = s.goertzelQ1 * s.goertzelQ1
+               + s.goertzelQ2 * s.goertzelQ2
+               - GOERTZEL_COEFF * s.goertzelQ1 * s.goertzelQ2;
+    // Reset for next block
+    s.goertzelQ0 = 0;
+    s.goertzelQ1 = 0;
+    s.goertzelQ2 = 0;
+    s.sampleCount = 0;
+    return mag2;
+  }
+  return -1.0f;  // block not complete yet
+}
+
+// Sonar state machine step (called from main loop)  — ALL DISABLED
+void sonarStep() {
+  // *** ENTIRE SONAR EXCITATION AND LISTENING DISABLED DUE TO HW BUG ***
+  // The code below shows the intended logic for reference.
+
+  /*
+  uint32_t nowUs = micros();
+  uint32_t nowMs = millis();
+
+  // Round-robin: start a new measurement every SONAR_CYCLE_MS
+  if (sonar[sonarActiveCh].state == SONAR_IDLE) {
+    if (nowMs - lastSonarCycleMs >= SONAR_CYCLE_MS) {
+      lastSonarCycleMs = nowMs;
+      sonarStartExcite(sonarActiveCh);
+    }
+  }
+
+  SonarChannel &s = sonar[sonarActiveCh];
+
+  switch (s.state) {
+    case SONAR_EXCITING: {
+      // Excite for SONAR_EXCITE_CYCLES at 40 kHz = 200 µs
+      uint32_t exciteDurationUs = (SONAR_EXCITE_CYCLES * 1000000UL) / SONAR_TARGET_FREQ;
+      if (nowUs - s.exciteStartUs >= exciteDurationUs) {
+        sonarStartListen(sonarActiveCh);
+      }
+      break;
+    }
+
+    case SONAR_LISTENING: {
+      // Read analog sample from echo pin
+      float sample = (float)analogRead(s.echoPin);
+
+      // Feed to Goertzel filter
+      float mag2 = sonarGoertzelProcess(s, sample);
+      if (mag2 >= 0.0f) {
+        // Block complete — check threshold (tuned empirically)
+        const float ECHO_THRESHOLD = 50000.0f;
+        if (mag2 > ECHO_THRESHOLD && !s.echoDetected) {
+          s.echoDetected = true;
+          s.echoTimeUs = nowUs - s.listenStartUs;
+        }
+      }
+
+      // Timeout: max range ~4m → ~23 ms round-trip
+      if (nowUs - s.listenStartUs > 25000) {
+        if (s.echoDetected) {
+          float distCm = (s.echoTimeUs * SONAR_SPEED_OF_SOUND_CM_US) / 2.0f;
+          if (distCm < 1.0f) distCm = 1.0f;
+          if (distCm > SONAR_MAX_RANGE_CM) {
+            s.distanceCm = 255;
+          } else {
+            s.distanceCm = (uint8_t)distCm;
+          }
+        } else {
+          s.distanceCm = 255;  // no echo → no object
+        }
+        s.state = SONAR_DONE;
+      }
+      break;
+    }
+
+    case SONAR_DONE:
+      s.state = SONAR_IDLE;
+      sonarActiveCh = (sonarActiveCh + 1) % SONAR_CHANNELS;
+      break;
+
+    case SONAR_IDLE:
+      break;
+  }
+  */
+
+  // With sonar disabled, report 0 (sensor error) for all channels
+  for (int i = 0; i < SONAR_CHANNELS; i++) {
+    sonar[i].distanceCm = 0;  // 0 = sensor error / disabled
   }
 }
 
-// ═════════════════════════════════════════════════════════════════════
-//  0x5FF SILIXCON CONTROL TX
-//
-//  Byte 0-1  INT16  CAN Level 1  (accelerator, 0 when braking)
-//  Byte 2-3  INT16  CAN Level 2  (regen, = throttle when braking)
-//  Byte 4-5  INT16  CAN Level 3  (always 0)
-//  Byte 6    Digital inputs:
-//              bit 0 = mapping command (one-shot)
-//              bit 1 = reverse
-//              bit 2 = digital brake
-//              bit 3 = 0
-//  Byte 7    0x00
-// ═════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  CURRENT SENSING — round-robin ADS1115 reads
+// ═══════════════════════════════════════════════════════════════════
+void readCurrentSensors() {
+  uint32_t now = millis();
+  if (now - lastAdsReadMs < ADS_READ_INTERVAL_MS) return;
+  lastAdsReadMs = now;
 
-uint16_t scaledThrottle() {
-  if (!throttleValid) return 0;
-  uint32_t scaled = ((uint32_t)throttleByte * (uint32_t)THROTTLE_MAX_LEVEL) / 255UL;
-  if (scaled > THROTTLE_MAX_LEVEL) scaled = THROTTLE_MAX_LEVEL;
-  return (uint16_t)scaled;
+  AdsChanMap &m = adsChanMap[adsNextChan];
+  if (m.ads != NULL && *(m.ok)) {
+    // ADS1115 at gain 16 (±0.256V), LSB = 0.0078125 mV
+    // Voltage across 1 mΩ shunt: V = LSB * raw  (in mV)
+    // Current: I = V / R → with 1 mΩ, I_mA = V_mV
+    int16_t raw = m.ads->readADC_SingleEnded(m.chan);
+    float voltageMv = raw * 0.0078125f;
+    currentMa[adsNextChan] = (int16_t)voltageMv;
+  }
+
+  // Check thresholds
+  for (int i = 0; i < 8; i++) {
+    currentAlert[i] = false;
+    if (thresholdLowMa[i] > 0 && currentMa[i] < thresholdLowMa[i]) {
+      currentAlert[i] = true;
+    }
+    if (thresholdHighMa[i] > 0 && currentMa[i] > thresholdHighMa[i]) {
+      currentAlert[i] = true;
+    }
+  }
+
+  adsNextChan = (adsNextChan + 1) % 8;
 }
 
-void send5ffIfEnabled() {
-  if (!canOk || !can5ffEnabled) return;
-
+// ═══════════════════════════════════════════════════════════════════
+//  AMBIENT LIGHT — VEML7700
+// ═══════════════════════════════════════════════════════════════════
+void readAmbientLight() {
+  if (!veml_ok) return;
   uint32_t now = millis();
-  if (now - last5ffTxMs < CAN_5FF_INTERVAL_MS) return;
-  last5ffTxMs = now;
+  if (now - lastVemlReadMs < VEML_READ_INTERVAL_MS) return;
+  lastVemlReadMs = now;
 
-  uint16_t throttle = scaledThrottle();
-  uint16_t lvl1 = cmdBrake ? 0        : throttle;   // Accel
-  uint16_t lvl2 = cmdBrake ? throttle : 0;           // Regen
-  uint16_t lvl3 = 0;
+  float lux = veml.readLux();
+  ambientLux = (isnan(lux) || isinf(lux) || lux < 0.0f) ? 0.0f : lux;
+}
 
-  uint8_t byte6 = 0;
-  if (mappingPulsePending) byte6 |= (1 << 0);
-  if (reverseLatched)      byte6 |= (1 << 1);
-  if (cmdBrake)            byte6 |= (1 << 2);
+// Encode lux → 16-bit fixed-exponent format
+// lux = M × 2^E × 0.1    →   M = lux / (2^E × 0.1)
+uint16_t encodeLux(float lux) {
+  if (lux < 0.0f) lux = 0.0f;
+  for (uint8_t e = 0; e < 16; e++) {
+    float scale = 0.1f * (float)(1 << e);
+    float m = lux / scale;
+    if (m <= 4095.0f) {
+      uint16_t mInt = (uint16_t)m;
+      return ((uint16_t)e << 12) | (mInt & 0x0FFF);
+    }
+  }
+  return 0xFFFF;  // overflow
+}
 
+// ═══════════════════════════════════════════════════════════════════
+//  CAN RX — read all pending messages
+// ═══════════════════════════════════════════════════════════════════
+void readCAN() {
   twai_message_t msg;
-  msg.identifier       = CAN_ID_SILIXCON_CONTROL;
-  msg.extd             = 0;
-  msg.rtr              = 0;
-  msg.ss               = 0;
-  msg.self             = 0;
-  msg.dlc_non_comp     = 0;
-  msg.data_length_code = 8;
-  msg.data[0] = (uint8_t)(lvl1 & 0xFF);
-  msg.data[1] = (uint8_t)((lvl1 >> 8) & 0xFF);
-  msg.data[2] = (uint8_t)(lvl2 & 0xFF);
-  msg.data[3] = (uint8_t)((lvl2 >> 8) & 0xFF);
-  msg.data[4] = (uint8_t)(lvl3 & 0xFF);
-  msg.data[5] = (uint8_t)((lvl3 >> 8) & 0xFF);
-  msg.data[6] = byte6;
-  msg.data[7] = 0x00;
+  while (twai_receive(&msg, 0) == ESP_OK) {
+    switch (msg.identifier) {
+      case CAN_ID_LIGHT_CONTROL: {
+        if (msg.data_length_code >= 2) {
+          canCmdBitsPrev = canCmdBits;
+          canCmdBits = (uint16_t)(msg.data[0] | (msg.data[1] << 8));
+          lastCanCmdMs = millis();
+          canCmdValid = true;
+        }
+        break;
+      }
+      case CAN_ID_SET_THRESHOLD: {
+        if (msg.data_length_code >= 5) {
+          uint8_t ch = msg.data[0];
+          if (ch < 8) {
+            thresholdLowMa[ch]  = (int16_t)(msg.data[1] | (msg.data[2] << 8));
+            thresholdHighMa[ch] = (int16_t)(msg.data[3] | (msg.data[4] << 8));
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
 
-  if (twai_transmit(&msg, pdMS_TO_TICKS(5)) == ESP_OK) {
-    last5ffValid  = true;
-    last5ffSentMs = millis();
-    for (uint8_t i = 0; i < 8; i++) last5ffData[i] = msg.data[i];
-    if (mappingPulsePending) mappingPulsePending = false;
+    // Update CAN RX log for the web dashboard
+    {
+      int freeSlot = -1, oldestIdx = 0;
+      uint32_t oldestMs = UINT32_MAX;
+      for (int i = 0; i < CAN_RX_LOG_SIZE; i++) {
+        if (canRxLog[i].used && canRxLog[i].id == msg.identifier) {
+          freeSlot = i;
+          break;
+        }
+        if (!canRxLog[i].used && freeSlot < 0) freeSlot = i;
+        if (canRxLog[i].lastMs < oldestMs) { oldestMs = canRxLog[i].lastMs; oldestIdx = i; }
+      }
+      if (freeSlot < 0) freeSlot = oldestIdx;
+      canRxLog[freeSlot].id  = msg.identifier;
+      canRxLog[freeSlot].dlc = msg.data_length_code;
+      uint8_t dlen = msg.data_length_code < 8 ? msg.data_length_code : 8;
+      memcpy(canRxLog[freeSlot].data, msg.data, dlen);
+      canRxLog[freeSlot].lastMs = millis();
+      canRxLog[freeSlot].used   = true;
+    }
   }
 }
 
-// ═════════════════════════════════════════════════════════════════════
-//  I2C SENSORS
-// ═════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  CAN TX — periodic telemetry broadcast
+// ═══════════════════════════════════════════════════════════════════
+uint32_t lastCanTxMs    = 0;
+#define  CAN_TX_INTERVAL_MS 100
 
-void readI2cSensors() {
+// Current channel broadcast round-robin
+uint8_t  canTxCurrChan  = 0;
+uint32_t lastCanCurrMs  = 0;
+#define  CAN_CURR_INTERVAL_MS 50  // one channel every 50 ms → all 8 in 400 ms
+
+void sendCanTelemetry() {
   uint32_t now = millis();
-  if (now - lastSensorReadMs < 200) return;
-  lastSensorReadMs = now;
 
-  if (ads48Ok) {
-    senseRaw[3] = ads48.readADC_SingleEnded(0);
-    senseRaw[2] = ads48.readADC_SingleEnded(1);
-    senseRaw[1] = ads48.readADC_SingleEnded(2);
-    senseRaw[0] = ads48.readADC_SingleEnded(3);
-  }
-  if (ads49Ok) {
-    senseRaw[7] = ads49.readADC_SingleEnded(0);
-    senseRaw[6] = ads49.readADC_SingleEnded(1);
-    senseRaw[5] = ads49.readADC_SingleEnded(2);
-    senseRaw[4] = ads49.readADC_SingleEnded(3);
-  }
-  for (uint8_t i = 0; i < 8; i++)
-    senseCurrentA[i] = ((float)senseRaw[i]) * 0.1875f;
+  // ── Mosfet status + proximity + ambient @ 10 Hz ──
+  if (now - lastCanTxMs >= CAN_TX_INTERVAL_MS) {
+    lastCanTxMs = now;
+    twai_message_t msg;
+    msg.flags = 0;
 
-  if (vemlOk) luxValue = veml.readLux(VEML_LUX_NORMAL_NOWAIT);
+    // MOSFET status (1 byte)
+    msg.identifier       = CAN_ID_MOSFET_STATUS;
+    msg.data_length_code = 1;
+    msg.data[0] = (uint8_t)(canCmdBits & 0xFF);
+    twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+    // Proximity (3 bytes)
+    msg.identifier       = CAN_ID_PROXIMITY;
+    msg.data_length_code = 3;
+    msg.data[0] = sonar[0].distanceCm;
+    msg.data[1] = sonar[1].distanceCm;
+    msg.data[2] = sonar[2].distanceCm;
+    twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+    // Ambient light (2 bytes)
+    msg.identifier       = CAN_ID_AMBIENT;
+    msg.data_length_code = 2;
+    uint16_t luxEnc = encodeLux(ambientLux);
+    msg.data[0] = (uint8_t)(luxEnc & 0xFF);
+    msg.data[1] = (uint8_t)((luxEnc >> 8) & 0xFF);
+    twai_transmit(&msg, pdMS_TO_TICKS(5));
+  }
+
+  // ── Current per channel @ 20 Hz round-robin ──
+  if (now - lastCanCurrMs >= CAN_CURR_INTERVAL_MS) {
+    lastCanCurrMs = now;
+    twai_message_t msg;
+    msg.flags            = 0;
+    msg.identifier       = CAN_ID_CURRENT_CH0 + canTxCurrChan;
+    msg.data_length_code = 2;
+    msg.data[0] = (uint8_t)(currentMa[canTxCurrChan] & 0xFF);
+    msg.data[1] = (uint8_t)((currentMa[canTxCurrChan] >> 8) & 0xFF);
+    twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+    canTxCurrChan = (canTxCurrChan + 1) % 8;
+  }
 }
 
-// ═════════════════════════════════════════════════════════════════════
-//  WEB UI
-// ═════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  SMART LIGHT FSM — front board only
+//  Determines desired state from CAN bits, then pulses MOSFET_GATE_1
+//  to cycle the physical lamp's edge-triggered controller.
+// ═══════════════════════════════════════════════════════════════════
+#if IS_FRONT_BOARD
 
+void smartLightStep() {
+  uint32_t now = millis();
+
+  // Determine desired state from CAN command bits
+  bool wantHigh = (canCmdValid && (canCmdBits & (1 << BIT_HIGH_BEAM)));
+  bool wantLow  = (canCmdValid && (canCmdBits & (1 << BIT_LOW_BEAM)));
+
+  if (wantHigh) {
+    slDesired = SL_HIGH_BEAM;
+  } else if (wantLow) {
+    slDesired = SL_LOW_BEAM;
+  } else {
+    slDesired = SL_DRL;
+  }
+
+  // If edge pulse is active, check if it's time to end it
+  if (slEdgeActive) {
+    if (now - slLastEdgeMs >= SL_PULSE_MS) {
+      // End pulse — drop MOSFET
+      if (mcp_ok) mcp.digitalWrite(MCP_MOSFET_GATE_1, LOW);
+      slEdgeActive = false;
+
+      // Advance lamp state (the lamp saw a rising edge)
+      switch (slCurrent) {
+        case SL_DRL:       slCurrent = SL_LOW_BEAM;  break;
+        case SL_LOW_BEAM:  slCurrent = SL_HIGH_BEAM; break;
+        case SL_HIGH_BEAM: slCurrent = SL_LOW_BEAM;  break;
+      }
+    }
+    return;  // don't start another edge while one is active
+  }
+
+  // Already in desired state — nothing to do
+  if (slCurrent == slDesired) return;
+
+  // Rate limit: min 1 s between edges
+  if (now - slLastEdgeMs < SL_EDGE_MIN_MS) return;
+
+  // Can't return to DRL via edges (lamp doesn't support it)
+  if (slDesired == SL_DRL) return;
+
+  // Need an edge: activate pulse
+  slEdgeActive = true;
+  slLastEdgeMs = now;
+  if (mcp_ok) mcp.digitalWrite(MCP_MOSFET_GATE_1, HIGH);
+}
+
+#endif // IS_FRONT_BOARD
+
+// ═══════════════════════════════════════════════════════════════════
+//  OUTPUT STAGE — apply CAN command bits to MOSFET gates
+// ═══════════════════════════════════════════════════════════════════
+void applyOutputs() {
+  if (!mcp_ok) return;
+
+  uint32_t now = millis();
+
+  // Watchdog: if no CAN command for 3 s, turn everything off
+  if (canCmdValid && (now - lastCanCmdMs >= CAN_CMD_TIMEOUT_MS)) {
+    canCmdValid = false;
+    canCmdBits = 0;
+    canCmdBitsPrev = 0;
+#if IS_FRONT_BOARD
+    mcp.digitalWrite(MCP_MOSFET_GATE_1, LOW);
+    slEdgeActive = false;
+#endif
+  }
+
+  uint16_t bits = canCmdValid ? canCmdBits : 0;
+
+  // Apply each bit to its mapped MOSFET (except smart-light bits on front)
+  for (int b = 0; b < 11; b++) {
+#if IS_FRONT_BOARD
+    if (b == BIT_HIGH_BEAM || b == BIT_LOW_BEAM) continue;
+#endif
+    int8_t pin = bitToMosfetPin[b];
+    if (pin < 0) continue;
+    bool on = (bits >> b) & 1;
+    if (manualOverrideEnabled[b]) {
+      on = manualOverrideState[b];
+    }
+    mcp.digitalWrite(pin, on ? HIGH : LOW);
+  }
+
+#if IS_FRONT_BOARD
+  smartLightStep();
+#endif
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SETUP HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+void setupCAN() {
+  twai_general_config_t g_config =
+    TWAI_GENERAL_CONFIG_DEFAULT(PIN_CAN_TX, PIN_CAN_RX, TWAI_MODE_NORMAL);
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
+    Serial.println("[CAN] Driver installed");
+  } else {
+    Serial.println("[CAN] Driver install FAILED");
+  }
+  if (twai_start() == ESP_OK) {
+    Serial.println("[CAN] Started @ 1 Mbps");
+  } else {
+    Serial.println("[CAN] Start FAILED");
+  }
+}
+
+void setupMCP() {
+  if (mcp.begin_I2C(0x20)) {
+    mcp_ok = true;
+    Serial.println("[MCP] 0x20 OK");
+
+    // GPB: all MOSFET gates → output, initially LOW
+    for (int p = 8; p <= 15; p++) {
+      mcp.pinMode(p, OUTPUT);
+      mcp.digitalWrite(p, LOW);
+    }
+
+    // GPA: piezo enables → output, initially LOW (High-Z = disabled)
+    for (int p = 0; p <= 5; p++) {
+      mcp.pinMode(p, OUTPUT);
+      mcp.digitalWrite(p, LOW);
+    }
+  } else {
+    Serial.println("[MCP] 0x20 NOT FOUND");
+  }
+}
+
+void setupADS() {
+  if (ads0.begin(0x48)) {
+    ads0_ok = true;
+    ads0.setGain(GAIN_SIXTEEN);  // ±0.256V
+    ads0.setDataRate(RATE_ADS1115_860SPS);
+    Serial.println("[ADS] 0x48 OK");
+  } else {
+    Serial.println("[ADS] 0x48 NOT FOUND");
+  }
+
+  if (ads1.begin(0x49)) {
+    ads1_ok = true;
+    ads1.setGain(GAIN_SIXTEEN);
+    ads1.setDataRate(RATE_ADS1115_860SPS);
+    Serial.println("[ADS] 0x49 OK");
+  } else {
+    Serial.println("[ADS] 0x49 NOT FOUND");
+  }
+
+  // Build channel map:
+  // ads0: AIN0=SENSE_3, AIN1=SENSE_2, AIN2=SENSE_1, AIN3=SENSE_0
+  adsChanMap[0] = { &ads0, 3, &ads0_ok };
+  adsChanMap[1] = { &ads0, 2, &ads0_ok };
+  adsChanMap[2] = { &ads0, 1, &ads0_ok };
+  adsChanMap[3] = { &ads0, 0, &ads0_ok };
+
+  // ads1: AIN0=SENSE_7, AIN1=SENSE_6, AIN2=SENSE_5, AIN3=SENSE_4
+  adsChanMap[4] = { &ads1, 3, &ads1_ok };
+  adsChanMap[5] = { &ads1, 2, &ads1_ok };
+  adsChanMap[6] = { &ads1, 1, &ads1_ok };
+  adsChanMap[7] = { &ads1, 0, &ads1_ok };
+}
+
+void setupVEML() {
+  if (veml.begin()) {
+    veml_ok = true;
+    veml.setGain(VEML7700_GAIN_1);
+    veml.setIntegrationTime(VEML7700_IT_100MS);
+    Serial.println("[VEML] 0x10 OK");
+  } else {
+    Serial.println("[VEML] 0x10 NOT FOUND");
+  }
+}
+
+void setupGPIO() {
+  // CAN standby pin — drive LOW for normal operation
+  pinMode(PIN_CAN_S, OUTPUT);
+  digitalWrite(PIN_CAN_S, LOW);
+
+  // Sonar echo analog inputs
+  pinMode(PIN_SONAR_ECHO_A, INPUT);
+  pinMode(PIN_SONAR_ECHO_B, INPUT);
+  pinMode(PIN_SONAR_ECHO_C, INPUT);
+
+  // Piezo PWM pins — LOW (disabled)
+  pinMode(PIN_PIEZO_PWM_HALF_X, OUTPUT);
+  digitalWrite(PIN_PIEZO_PWM_HALF_X, LOW);
+  pinMode(PIN_PIEZO_PWM_HALF_Y, OUTPUT);
+  digitalWrite(PIN_PIEZO_PWM_HALF_Y, LOW);
+}
+
+void setupNeoPixel() {
+  pixels.begin();
+  pixels.setBrightness(30);
+  pixels.setPixelColor(0, pixels.Color(0, 0, 50));  // dim blue = alive
+  pixels.show();
+  Serial.println("[LED] WS2812 status LED set");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  WI-FI DASHBOARD — HTTP page handler
+// ═══════════════════════════════════════════════════════════════════
 void handleRoot() {
-  String html = R"rawliteral(
-<!DOCTYPE html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Velion Lightboard</title>
-<style>
-body{font-family:Consolas,monospace;background:#0c1118;color:#d9e6f2;margin:0;padding:14px}
-h1,h2{margin:8px 0}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:10px}
-.card{background:#111b27;border:1px solid #2c425c;border-radius:8px;padding:10px}
-table{width:100%;border-collapse:collapse}
-th,td{border:1px solid #2c425c;padding:5px;font-size:12px;text-align:left}
-th{background:#152638}
-button{background:#1f3a56;color:#d9e6f2;border:1px solid #436487;padding:5px 8px;cursor:pointer;border-radius:4px;font-size:11px}
-.pill{display:inline-block;padding:2px 6px;border:1px solid #436487;border-radius:999px;margin-left:4px}
-.ok{color:#58d68d}.bad{color:#ff7f7f}
-select,input{background:#0d1722;color:#d9e6f2;border:1px solid #436487;padding:3px;font-size:12px}
-.term{background:#0a111a;border:1px solid #203042;max-height:220px;overflow:auto;padding:6px;white-space:pre-wrap;font-size:11px}
-.sv{color:#58d68d;font-size:11px;margin-left:6px}
-</style>
-</head><body>
-<h1>Velion Lightboard</h1>
-<div class="cards">
+  uint32_t now = millis();
+  char buf[32];
+  String html;
+  html.reserve(4096);
 
-<div class="card"><h2>Device</h2>
-<table>
-<tr><td>SSID</td><td><input id="ssid" size="18" maxlength="31"> <input id="pass" size="12" maxlength="31" placeholder="password"> <button onclick="saveSsid()">Save AP</button><span id="ssidS" class="sv"></span></td></tr>
-<tr><td>Mode</td><td><button onclick="setMode('auto')">AUTO</button> <button onclick="setMode('manual')">MANUAL</button> <span id="modeV"></span></td></tr>
-<tr><td>0x5FF TX</td><td><button onclick="setTx5ff(1)">Enable</button> <button onclick="setTx5ff(0)">Disable</button> <span id="txV"></span></td></tr>
-</table>
-<div id="info" style="margin-top:6px;font-size:11px"></div>
-</div>
+  // ── Head
+  html += "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+          "<meta http-equiv='refresh' content='2'>"
+          "<title>Velion ";
+  html += IS_FRONT_BOARD ? "Frontboard" : "Rearboard";
+  html += "</title>"
+          "<style>"
+          "body{font-family:monospace;background:#111;color:#ddd;padding:12px;margin:0}"
+          "h2{color:#4af;margin:0 0 10px}"
+          "h3{color:#777;margin:10px 0 3px;font-size:.82em;text-transform:uppercase}"
+          "table{border-collapse:collapse;width:100%;max-width:600px;margin-bottom:6px}"
+          "th{background:#1a1a1a;padding:3px 8px;text-align:left;color:#555;font-size:.78em}"
+          "td{padding:3px 8px;border-bottom:1px solid #1c1c1c;font-size:.85em}"
+          ".on{color:#3d3;font-weight:bold}.off{color:#444}"
+          ".warn{color:#fa4}.err{color:#f55}.dim{color:#444;font-size:.8em}"
+          "button{background:#1c2a1c;color:#9f9;border:1px solid #2e4c2e;padding:2px 8px;cursor:pointer}"
+          "button.alt{background:#2a1c1c;color:#f99;border-color:#4c2e2e}"
+          "form{display:inline;margin:0}"
+          "</style></head><body>";
 
-<div class="card"><h2>MOSFET Gate Mapping</h2>
-<button onclick="resetMap('front')">Front Defaults</button> <button onclick="resetMap('rear')">Rear Defaults</button>
-<div id="gates"></div></div>
+  html += "<h2>&#9889; Velion ";
+  html += IS_FRONT_BOARD ? "Frontboard" : "Rearboard";
+  html += "</h2>";
 
-<div class="card"><h2>CAN Signal Sources</h2><div id="sigcfg"></div></div>
-
-<div class="card"><h2>Long/Short Button</h2>
-<table><tr><td>CAN ID</td><td>0x<input id="bCid" type="text" size="4" maxlength="4"></td>
-<td>Bit</td><td><input id="bBit" type="number" min="0" max="15" style="width:3em"></td>
-<td><button onclick="saveBtn()">Save</button><span id="btnS" class="sv"></span></td></tr></table>
-<div id="btnSt" style="margin-top:4px;font-size:11px"></div>
-</div>
-
-<div class="card"><h2>0x5FF Frame</h2><div id="tx5ff"></div></div>
-<div class="card"><h2>Decoded Signals</h2><div id="decoded"></div></div>
-<div class="card"><h2>I2C / Sensors</h2><div id="i2c"></div><div id="sens" style="margin-top:6px"></div></div>
-<div class="card" style="grid-column:1/-1"><h2>Serial</h2><div id="serial" class="term"></div></div>
-<div class="card" style="grid-column:1/-1"><h2>CAN Bus</h2><div id="can" class="term"></div></div>
-</div>
-<script>
-let cfgDone=false;
-function yn(v){return v?'<span class="ok">OK</span>':'<span class="bad">FAIL</span>';}
-function sv(id){let e=document.getElementById(id);if(e){e.textContent='Saved!';setTimeout(()=>e.textContent='',2000);}}
-async function setMode(m){await fetch('/api/mode?mode='+m);}
-async function setGate(i,v){await fetch('/api/gate?idx='+i+'&val='+(v?1:0));}
-async function setTx5ff(v){await fetch('/api/config?tx5ff='+(v?1:0));}
-async function saveGateMap(g){await fetch('/api/config?gate='+g+'&fn='+document.getElementById('gm_'+g).value);sv('gs_'+g);}
-async function saveSigMap(i){
-  let c=document.getElementById('sc_'+i).value;
-  let b=document.getElementById('sb_'+i).value;
-  await fetch('/api/sigmap?sig='+i+'&canId='+c+'&bit='+b);sv('ss_'+i);
-}
-async function saveSsid(){
-  let s=encodeURIComponent(document.getElementById('ssid').value);
-  let p=encodeURIComponent(document.getElementById('pass').value);
-  await fetch('/api/config?ssid='+s+'&pass='+p);sv('ssidS');
-}
-async function saveBtn(){
-  let c=document.getElementById('bCid').value;
-  let b=document.getElementById('bBit').value;
-  await fetch('/api/config?btnCid='+c+'&btnBit='+b);sv('btnS');
-}
-async function resetMap(role){await fetch('/api/config?reset='+role);cfgDone=false;await poll();}
-
-function gatesHtml(d){
-  let h='<table><tr><th>Gate</th><th>Function</th><th></th><th>State</th><th>Manual</th></tr>';
-  for(let i=0;i<8;i++){
-    h+='<tr><td>'+i+'</td><td><select id="gm_'+i+'">';
-    for(const o of d.fnOpt){h+='<option value="'+o.v+'"'+(o.v===d.map[i]?' selected':'')+'>'+o.n+'</option>';}
-    h+='</select> <button onclick="saveGateMap('+i+')">Save</button><span id="gs_'+i+'" class="sv"></span></td>';
-    h+='<td class="'+(d.applied[i]?'ok':'')+'">'+( d.applied[i]?'ON':'off')+'</td>';
-    h+='<td><button onclick="setGate('+i+',1)">ON</button> <button onclick="setGate('+i+',0)">OFF</button></td></tr>';
+  // ── CAN Command
+  html += "<h3>CAN Command</h3>"
+          "<table><tr><th>Field</th><th>Value</th></tr>"
+          "<tr><td>Status</td><td>";
+  html += canCmdValid ? "<span class='on'>&#10003; VALID</span>"
+                      : "<span class='warn'>&#9888; WATCHDOG &mdash; no command</span>";
+  snprintf(buf, sizeof(buf), "%04X", canCmdBits);
+  html += "</td></tr><tr><td>Control word</td><td>0x";
+  html += buf;
+  html += "</td></tr><tr><td>Last received</td><td>";
+  if (canCmdValid) {
+    snprintf(buf, sizeof(buf), "%lu ms ago", now - lastCanCmdMs);
+    html += buf;
+  } else {
+    html += "<span class='dim'>&mdash;</span>";
   }
-  return h+'</table>';
-}
+  html += "</td></tr></table>";
 
-function sigHtml(d){
-  let h='<table><tr><th>Signal</th><th>CAN ID (hex)</th><th>Bit</th><th>Raw</th><th>Val</th><th></th></tr>';
-  for(let i=0;i<d.sig.length;i++){const s=d.sig[i];
-    h+='<tr><td>'+s.n+'</td><td><input id="sc_'+i+'" size="4" maxlength="4" value="'+s.ch+'"></td>';
-    h+='<td><input id="sb_'+i+'" type="number" min="0" max="15" style="width:3em" value="'+s.bit+'"></td>';
-    h+='<td>'+(s.raw?'1':'0')+'</td><td>'+(s.v?'1':'0')+'</td>';
-    h+='<td><button onclick="saveSigMap('+i+')">Save</button><span id="ss_'+i+'" class="sv"></span></td></tr>';}
-  return h+'</table>';
-}
+  // ── MOSFET Outputs
+  static const char* bitNames[11] = {
+    "DRL", "Low Beam", "High Beam", "Left Blink", "Right Blink",
+    "Tail", "Brake", "Horn", "Reverse", "Fog", "Flash"
+  };
+  html += "<h3>MOSFET Outputs</h3>"
+          "<p class='dim'>Manual controls override CAN until set back to AUTO. "
+          "<a href='/auto_all'>Set all AUTO</a></p>"
+          "<table><tr><th>Signal</th><th>Gate</th><th>State</th><th>Control</th></tr>";
+  for (int b = 0; b < 11; b++) {
+    int mcpPin = bitToMosfetPin[b];
+    if (mcpPin < 0) continue;
+    int gateIdx = 15 - mcpPin;
+    bool canOn = canCmdValid && ((canCmdBits >> b) & 1);
+    bool on = manualOverrideEnabled[b] ? manualOverrideState[b] : canOn;
+    html += "<tr><td>";
+    html += bitNames[b];
+    snprintf(buf, sizeof(buf), "%d", gateIdx);
+    html += "</td><td>Gate ";
+    html += buf;
+    html += "</td><td>";
+    html += on ? "<span class='on'>ON</span>" : "<span class='off'>OFF</span>";
+    if (manualOverrideEnabled[b]) {
+      html += " <span class='warn'>(MANUAL)</span>";
+    } else {
+      html += " <span class='dim'>(CAN)</span>";
+    }
+    html += "</td><td>";
+    html += "<form method='get' action='/toggle'><input type='hidden' name='bit' value='";
+    html += String(b);
+    html += "'><button type='submit'>Toggle</button></form> ";
+    html += "<form method='get' action='/auto'><input type='hidden' name='bit' value='";
+    html += String(b);
+    html += "'><button type='submit' class='alt'>AUTO</button></form>";
+    html += "</td></tr>";
+  }
+#if IS_FRONT_BOARD
+  {
+    static const char* slNames[] = {"DRL", "Low Beam", "High Beam"};
+    html += "<tr><td>Smart Light</td><td>Gate 1</td><td>";
+    if (slEdgeActive) {
+      html += "<span class='warn'>&#8594; pulsing edge</span>";
+    } else {
+      html += "<span class='on'>";
+      html += slNames[slCurrent];
+      html += "</span>";
+    }
+    html += "</td><td><span class='dim'>FSM controlled</span></td></tr>";
+  }
+#endif
+  html += "</table>";
 
-async function poll(){try{
-  const d=await(await fetch('/api/state')).json();
-  const c=await(await fetch('/api/can')).json();
-  const l=await(await fetch('/api/log')).json();
+  // ── Ambient Light
+  html += "<h3>Ambient Light</h3>"
+          "<table><tr><th>Sensor</th><th>Value</th></tr>"
+          "<tr><td>VEML7700</td><td>";
+  if (veml_ok) {
+    snprintf(buf, sizeof(buf), "%.1f lux", ambientLux);
+    html += buf;
+  } else {
+    html += "<span class='err'>Not found</span>";
+  }
+  html += "</td></tr></table>";
 
-  document.getElementById('modeV').textContent=d.auto?'AUTO':'MANUAL';
-  document.getElementById('txV').textContent=d.tx5en?'ON':'OFF';
-  document.getElementById('info').innerHTML='AP: <b>'+d.ssid+'</b> | 0x400: 0x'+d.lwHex+(d.lwOk?' (ok)':' (stale)')
-    +' | Throttle: '+(d.thrV>=0?d.thrV:'stale')+' | LYNX: '+d.lynx+' ('+d.lynxN+') | PwrMap: '+d.pmap;
+  // ── Current Sensors
+  html += "<h3>Current Sensors</h3>"
+          "<table><tr><th>Channel</th><th>Current</th><th>Alert</th></tr>";
+  for (int i = 0; i < 8; i++) {
+    bool avail = (i < 4) ? ads0_ok : ads1_ok;
+    html += "<tr><td>SENSE_";
+    html += (char)('0' + i);
+    html += "</td><td>";
+    if (avail) {
+      snprintf(buf, sizeof(buf), "%d mA", currentMa[i]);
+      html += buf;
+    } else {
+      html += "<span class='err'>N/A</span>";
+    }
+    html += "</td><td>";
+    html += (avail && currentAlert[i]) ? "<span class='warn'>ALERT</span>"
+                                       : "<span class='dim'>&mdash;</span>";
+    html += "</td></tr>";
+  }
+  html += "</table>";
 
-  document.getElementById('btnSt').innerHTML='Reverse: <b>'+(d.rev?'ON':'off')+'</b> | MapPulse: '+(d.mpulse?'PENDING':'off');
+  // ── CAN RX Snapshot (latest packet per ID)
+  html += "<h3>CAN RX Snapshot</h3>"
+          "<p class='dim'>One row per CAN ID (latest packet only), sorted by ID.</p>"
+          "<table><tr><th>ID</th><th>DLC</th><th>Latest Data (hex)</th><th>Age</th></tr>";
 
-  if(!cfgDone){
-    document.getElementById('ssid').value=d.ssid;
-    document.getElementById('pass').value=d.apPass;
-    document.getElementById('bCid').value=d.bCidH;
-    document.getElementById('bBit').value=d.bBit;
-    document.getElementById('gates').innerHTML=gatesHtml(d);
-    document.getElementById('sigcfg').innerHTML=sigHtml(d);
-    cfgDone=true;
+  // Build a sorted view of used slots by CAN ID (ascending)
+  int rxIdx[CAN_RX_LOG_SIZE];
+  int rxCount = 0;
+  for (int i = 0; i < CAN_RX_LOG_SIZE; i++) {
+    if (canRxLog[i].used) rxIdx[rxCount++] = i;
+  }
+  for (int i = 0; i < rxCount - 1; i++) {
+    for (int j = i + 1; j < rxCount; j++) {
+      if (canRxLog[rxIdx[j]].id < canRxLog[rxIdx[i]].id) {
+        int t = rxIdx[i];
+        rxIdx[i] = rxIdx[j];
+        rxIdx[j] = t;
+      }
+    }
   }
 
-  // 0x5FF card
-  if(!d.txOk){document.getElementById('tx5ff').textContent='No TX yet';}
-  else{let b='';for(let i=0;i<8;i++){let h=d.txD[i].toString(16).toUpperCase();if(h.length<2)h='0'+h;b+=h+(i<7?' ':'');}
-    document.getElementById('tx5ff').innerHTML='Age: '+d.txAge+'ms<br>Data: <code>'+b+'</code>';}
+  bool anyRx = false;
+  for (int n = 0; n < rxCount; n++) {
+    int i = rxIdx[n];
+    anyRx = true;
+    snprintf(buf, sizeof(buf), "0x%03lX", (unsigned long)canRxLog[i].id);
+    html += "<tr><td>";
+    html += buf;
+    html += "</td><td>";
+    html += canRxLog[i].dlc;
+    html += "</td><td>";
+    for (int d = 0; d < canRxLog[i].dlc && d < 8; d++) {
+      snprintf(buf, sizeof(buf), "%02X ", canRxLog[i].data[d]);
+      html += buf;
+    }
+    html += "</td><td>";
+    uint32_t age = now - canRxLog[i].lastMs;
+    if (age < 10000UL) snprintf(buf, sizeof(buf), "%lu ms", age);
+    else               snprintf(buf, sizeof(buf), "%lu s",  age / 1000UL);
+    html += buf;
+    html += "</td></tr>";
+  }
+  if (!anyRx) {
+    html += "<tr><td colspan='4'><span class='dim'>No messages received yet</span></td></tr>";
+  }
+  html += "</table>";
 
-  // Decoded
-  let ds='';for(const k of['brake','tail','drl','left','right','horn','driving','passing','fog'])
-    ds+=k+': <span class="pill">'+(d[k]?'1':'0')+'</span> ';
-  document.getElementById('decoded').innerHTML=ds;
+  // ── Footer
+  snprintf(buf, sizeof(buf), "%lu s", now / 1000UL);
+  html += "<p class='dim'>Uptime: ";
+  html += buf;
+  html += " &nbsp;|&nbsp; MCP=";
+  html += mcp_ok  ? "OK" : "<span class='err'>ERR</span>";
+  html += " ADS0=";
+  html += ads0_ok ? "OK" : "<span class='err'>ERR</span>";
+  html += " ADS1=";
+  html += ads1_ok ? "OK" : "<span class='err'>ERR</span>";
+  html += " VEML=";
+  html += veml_ok ? "OK" : "<span class='err'>ERR</span>";
+  html += " &nbsp;|&nbsp; Auto-refresh 2s</p></body></html>";
 
-  // I2C
-  document.getElementById('i2c').innerHTML='MCP:'+yn(d.mcp)+' ADS48:'+yn(d.a48)+' ADS49:'+yn(d.a49)+' VEML:'+yn(d.vml);
-  let sh='<table><tr><th>Ch</th><th>Raw</th><th>A</th></tr>';
-  for(let i=0;i<8;i++)sh+='<tr><td>'+i+'</td><td>'+d.sr[i]+'</td><td>'+d.sa[i].toFixed(2)+'</td></tr>';
-  sh+='<tr><td>Lux</td><td colspan="2">'+d.lux.toFixed(1)+'</td></tr></table>';
-  document.getElementById('sens').innerHTML=sh;
-
-  document.getElementById('serial').textContent=l.lines?l.lines.join('\n'):'';
-  if(!c.entries.length){document.getElementById('can').textContent='No packets';}
-  else{let h='';for(const e of c.entries)h+=e.id+' | dlc='+e.dlc+' | '+e.data+' | '+e.age+'ms\n';
-    document.getElementById('can').textContent=h;}
-}catch(e){}}
-setInterval(poll,1500);poll();
-</script>
-</body></html>
-)rawliteral";
   webServer.send(200, "text/html", html);
 }
 
-// ═════════════════════════════════════════════════════════════════════
-//  WEB API HANDLERS
-// ═════════════════════════════════════════════════════════════════════
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
 
-void handleApiMode() {
-  if (!webServer.hasArg("mode")) { webServer.send(400,"application/json","{\"ok\":false}"); return; }
-  String m = webServer.arg("mode");
-  if      (m == "auto")   webAutoMode = true;
-  else if (m == "manual") webAutoMode = false;
-  else { webServer.send(400,"application/json","{\"ok\":false}"); return; }
-  webServer.send(200,"application/json","{\"ok\":true}");
-}
-
-void handleApiGate() {
-  uint8_t idx = 0;
-  if (!parseUIntArg("idx", 0, 7, idx) || !webServer.hasArg("val")) {
-    webServer.send(400,"application/json","{\"ok\":false}"); return;
-  }
-  manualGateState[idx] = (webServer.arg("val") == "1");
-  webServer.send(200,"application/json","{\"ok\":true}");
-}
-
-void handleApiConfig() {
-  bool changed = false;
-
-  if (webServer.hasArg("ssid")) {
-    String s = webServer.arg("ssid");
-    if (s.length() > 0 && s.length() < 32) {
-      s.toCharArray(apSsid, sizeof(apSsid));
-      changed = true;
-    }
-  }
-  if (webServer.hasArg("pass")) {
-    String p = webServer.arg("pass");
-    if (p.length() < 32) {
-      p.toCharArray(apPass, sizeof(apPass));
-      changed = true;
-    }
-  }
-  if (webServer.hasArg("tx5ff")) {
-    can5ffEnabled = (webServer.arg("tx5ff") == "1");
-    changed = true;
-    logf("[CFG] 0x5FF TX %s", can5ffEnabled ? "ON" : "OFF");
-  }
-  if (webServer.hasArg("btnCid")) {
-    char* endPtr = NULL;
-    String cidStr = webServer.arg("btnCid");
-    long v = strtol(cidStr.c_str(), &endPtr, 16);
-    if (endPtr != cidStr.c_str() && v >= 0 && v <= 0x7FF) {
-      btnCanId = (uint16_t)v;
-      changed = true;
-    }
-  }
-  if (webServer.hasArg("btnBit")) {
-    uint8_t b = 0;
-    if (parseUIntArg("btnBit", 0, 15, b)) { btnBit = b; changed = true; }
-  }
-  if (webServer.hasArg("gate") && webServer.hasArg("fn")) {
-    uint8_t gate = 0, fn = 0;
-    if (parseUIntArg("gate", 0, 7, gate) && parseUIntArg("fn", 0, FUNC_MAX, fn)) {
-      gateFunctionMap[gate] = fn;
-      changed = true;
-      logf("[CFG] gate %u -> %s", (unsigned)gate, functionName(fn));
-    }
-  }
-  if (webServer.hasArg("reset")) {
-    String r = webServer.arg("reset");
-    const uint8_t* def = (r == "front") ? kDefaultFrontMap : kDefaultRearMap;
-    for (uint8_t i = 0; i < 8; i++) gateFunctionMap[i] = def[i];
-    changed = true;
-    logf("[CFG] gate map reset to %s defaults", r.c_str());
+  if (!WiFi.config(WIFI_LOCAL_IP, WIFI_GATEWAY, WIFI_SUBNET, WIFI_GATEWAY, WIFI_GATEWAY)) {
+    Serial.println("[WiFi] Failed to set static IP config");
   }
 
-  if (changed) {
-    savePersistentConfig();
-    if (webServer.hasArg("ssid") || webServer.hasArg("pass")) {
-      WiFi.softAPdisconnect(true);
-      WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-      WiFi.softAP(apSsid, apPass);
-      logf("[CFG] AP restarted: %s", apSsid);
-    }
-  }
-  webServer.send(200,"application/json","{\"ok\":true}");
-}
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("[WiFi] Connecting to AP \"%s\"...\n", WIFI_SSID);
 
-void handleApiSigMap() {
-  if (!webServer.hasArg("sig") || !webServer.hasArg("canId") || !webServer.hasArg("bit")) {
-    webServer.send(400,"application/json","{\"ok\":false}"); return;
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(200);
+    Serial.print('.');
   }
-  uint8_t sig = 0;
-  if (!parseUIntArg("sig", 0, SIG_MAX, sig)) {
-    webServer.send(400,"application/json","{\"ok\":false}"); return;
-  }
-  char* endPtr = NULL;
-  String cidStr = webServer.arg("canId");
-  long cid = strtol(cidStr.c_str(), &endPtr, 16);
-  if (endPtr == cidStr.c_str() || cid < 0 || cid > 0xFFFF) {
-    webServer.send(400,"application/json","{\"ok\":false}"); return;
-  }
-  uint8_t bit = 0;
-  if (!parseUIntArg("bit", 0, 15, bit)) {
-    webServer.send(400,"application/json","{\"ok\":false}"); return;
-  }
-  signalMap[sig].canId = (uint16_t)cid;
-  signalMap[sig].bit   = bit;
-  savePersistentConfig();
-  logf("[SIG] %s -> 0x%03X bit%d", signalName(sig), (int)cid, (int)bit);
-  webServer.send(200,"application/json","{\"ok\":true}");
-}
+  Serial.println();
 
-void handleApiState() {
-  char lwHex[5]; snprintf(lwHex, sizeof(lwHex), "%04X", lightWord);
-  char bCidH[5]; snprintf(bCidH, sizeof(bCidH), "%03X", btnCanId);
-
-  String o = "{";
-  o += "\"ssid\":\"" + String(apSsid) + "\",";
-  o += "\"apPass\":\"" + String(apPass) + "\",";
-  o += "\"auto\":" + String(webAutoMode ? "true" : "false") + ",";
-  o += "\"lwHex\":\"" + String(lwHex) + "\",";
-  o += "\"lwOk\":" + String(lightWordValid ? "true" : "false") + ",";
-  o += "\"thrV\":" + String(throttleValid ? (int)throttleByte : -1) + ",";
-  o += "\"lynx\":" + String((int)lynxMode) + ",";
-  o += "\"lynxN\":\"" + String(lynxModeName(lynxMode)) + "\",";
-  o += "\"pmap\":" + String((int)currentPowerMap) + ",";
-  o += "\"tx5en\":" + String(can5ffEnabled ? "true" : "false") + ",";
-  o += "\"rev\":" + String(reverseLatched ? "true" : "false") + ",";
-  o += "\"mpulse\":" + String(mappingPulsePending ? "true" : "false") + ",";
-  o += "\"txOk\":" + String(last5ffValid ? "true" : "false") + ",";
-  o += "\"txAge\":" + String(last5ffValid ? (unsigned long)(millis() - last5ffSentMs) : 0UL) + ",";
-  o += "\"mcp\":" + String(mcpOk ? "true" : "false") + ",";
-  o += "\"a48\":" + String(ads48Ok ? "true" : "false") + ",";
-  o += "\"a49\":" + String(ads49Ok ? "true" : "false") + ",";
-  o += "\"vml\":" + String(vemlOk ? "true" : "false") + ",";
-  o += "\"passing\":" + String(cmdPassing ? "true" : "false") + ",";
-  o += "\"driving\":" + String(cmdDriving ? "true" : "false") + ",";
-  o += "\"left\":" + String(cmdLeftBlink ? "true" : "false") + ",";
-  o += "\"right\":" + String(cmdRightBlink ? "true" : "false") + ",";
-  o += "\"horn\":" + String(cmdHorn ? "true" : "false") + ",";
-  o += "\"brake\":" + String(cmdBrake ? "true" : "false") + ",";
-  o += "\"tail\":" + String(cmdTail ? "true" : "false") + ",";
-  o += "\"drl\":" + String(cmdDrl ? "true" : "false") + ",";
-  o += "\"fog\":" + String(cmdFog ? "true" : "false") + ",";
-  o += "\"bCidH\":\"" + String(bCidH) + "\",";
-  o += "\"bBit\":" + String((int)btnBit) + ",";
-
-  o += "\"manual\":[";
-  for (uint8_t i = 0; i < 8; i++) { if (i) o += ","; o += manualGateState[i] ? "true" : "false"; }
-  o += "],\"applied\":[";
-  for (uint8_t i = 0; i < 8; i++) { if (i) o += ","; o += lastAppliedGateState[i] ? "true" : "false"; }
-  o += "],\"map\":[";
-  for (uint8_t i = 0; i < 8; i++) { if (i) o += ","; o += String((int)gateFunctionMap[i]); }
-  o += "],\"fnOpt\":[";
-  for (uint8_t f = 0; f <= FUNC_MAX; f++) { if (f) o += ","; o += "{\"v\":" + String((int)f) + ",\"n\":\"" + String(functionName(f)) + "\"}"; }
-
-  o += "],\"sig\":[";
-  for (uint8_t s = 0; s <= SIG_MAX; s++) {
-    if (s) o += ",";
-    bool v = false;
-    switch (s) {
-      case SIG_PASSING: v = cmdPassing;   break; case SIG_DRIVING: v = cmdDriving;   break;
-      case SIG_LEFT:    v = cmdLeftBlink;  break; case SIG_RIGHT:   v = cmdRightBlink; break;
-      case SIG_HORN:    v = cmdHorn;       break; case SIG_BRAKE:   v = cmdBrake;      break;
-      case SIG_TAIL:    v = cmdTail;       break; case SIG_DRL:     v = cmdDrl;        break;
-      case SIG_FOG:     v = cmdFog;        break;
-    }
-    char ch[5]; snprintf(ch, sizeof(ch), "%03X", signalMap[s].canId);
-    o += "{\"n\":\"" + String(signalName(s)) + "\",\"ch\":\"" + String(ch) + "\",\"bit\":" + String((int)signalMap[s].bit);
-    o += ",\"raw\":" + String(signalRawState[s] ? "true" : "false") + ",\"v\":" + String(v ? "true" : "false") + "}";
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WiFi] Connected, local IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("[WiFi] Connect timeout; dashboard may be unavailable until AP is reachable");
   }
 
-  o += "],\"txD\":[";
-  for (uint8_t i = 0; i < 8; i++) { if (i) o += ","; o += String((int)last5ffData[i]); }
-  o += "],\"sr\":[";
-  for (uint8_t i = 0; i < 8; i++) { if (i) o += ","; o += String((int)senseRaw[i]); }
-  o += "],\"sa\":[";
-  for (uint8_t i = 0; i < 8; i++) { if (i) o += ","; o += String(senseCurrentA[i], 3); }
-  o += "],\"lux\":" + String(luxValue, 2);
-  o += "}";
-  webServer.send(200, "application/json", o);
-}
-
-void handleApiCan() {
-  int idx[CAN_TRACK_MAX];
-  int count = 0;
-  for (int i = 0; i < CAN_TRACK_MAX; i++)
-    if (canTrack[i].used) idx[count++] = i;
-  // Sort by CAN ID ascending
-  for (int i = 1; i < count; i++) {
-    int key = idx[i]; int j = i - 1;
-    while (j >= 0 && canTrack[idx[j]].id > canTrack[key].id) { idx[j+1] = idx[j]; j--; }
-    idx[j+1] = key;
-  }
-  uint32_t now = millis();
-  String o = "{\"entries\":[";
-  for (int n = 0; n < count; n++) {
-    if (n) o += ",";
-    const CanTrack& e = canTrack[idx[n]];
-    char ib[6]; snprintf(ib, sizeof(ib), "0x%03lX", (unsigned long)e.id);
-    o += "{\"id\":\"" + String(ib) + "\",\"dlc\":" + String((int)e.dlc) + ",\"data\":\"";
-    for (uint8_t b = 0; b < e.dlc && b < 8; b++) {
-      o += hexByte(e.data[b]);
-      if (b + 1 < e.dlc && b < 7) o += " ";
-    }
-    o += "\",\"age\":" + String((unsigned long)(now - e.lastMs)) + "}";
-  }
-  o += "]}";
-  webServer.send(200, "application/json", o);
-}
-
-void handleApiLog() {
-  String o = "{\"lines\":[";
-  for (uint8_t i = 0; i < serialLogCount; i++) {
-    if (i) o += ",";
-    uint8_t idx = (uint8_t)((serialLogHead + SERIAL_LOG_MAX - serialLogCount + i) % SERIAL_LOG_MAX);
-    String line = serialLog[idx];
-    line.replace("\\", "\\\\");
-    line.replace("\"", "\\\"");
-    o += "\"" + line + "\"";
-  }
-  o += "]}";
-  webServer.send(200, "application/json", o);
-}
-
-// ═════════════════════════════════════════════════════════════════════
-//  HARDWARE SETUP
-// ═════════════════════════════════════════════════════════════════════
-
-void setupMcp() {
-  mcpOk = mcp.begin_I2C(0x20);
-  if (!mcpOk) { logLine("[I2C] MCP23017 0x20 not found"); return; }
-  for (uint8_t g = 0; g < 8; g++) {
-    mcp.pinMode(kGateToMcpPin[g], OUTPUT);
-    mcp.digitalWrite(kGateToMcpPin[g], LOW);
-    lastAppliedGateState[g] = false;
-  }
-}
-
-void setupSensors() {
-  ads48Ok = ads48.begin(0x48, &Wire);
-  ads49Ok = ads49.begin(0x49, &Wire);
-  if (ads48Ok) ads48.setGain(GAIN_TWOTHIRDS);
-  if (ads49Ok) ads49.setGain(GAIN_TWOTHIRDS);
-  vemlOk = veml.begin();
-  if (vemlOk) {
-    veml.setGain(VEML7700_GAIN_1_8);
-    veml.setIntegrationTime(VEML7700_IT_100MS);
-  }
-}
-
-void setupCAN() {
-  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(PIN_CAN_TX, PIN_CAN_RX, TWAI_MODE_NORMAL);
-  twai_timing_config_t  t = TWAI_TIMING_CONFIG_1MBITS();
-  twai_filter_config_t  f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-  if (twai_driver_install(&g, &t, &f) != ESP_OK) { logLine("[CAN] install failed"); canOk = false; return; }
-  if (twai_start() != ESP_OK) { logLine("[CAN] start failed"); canOk = false; return; }
-  canOk = true;
-}
-
-void setupWeb() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-  WiFi.softAP(apSsid, apPass);
-
-  webServer.on("/",           handleRoot);
-  webServer.on("/api/state",  handleApiState);
-  webServer.on("/api/can",    handleApiCan);
-  webServer.on("/api/mode",   handleApiMode);
-  webServer.on("/api/gate",   handleApiGate);
-  webServer.on("/api/config", handleApiConfig);
-  webServer.on("/api/sigmap", handleApiSigMap);
-  webServer.on("/api/log",    handleApiLog);
+  webServer.on("/", handleRoot);
+  webServer.on("/toggle", handleToggleOutput);
+  webServer.on("/auto", handleAutoOutput);
+  webServer.on("/auto_all", handleAutoAllOutputs);
   webServer.begin();
+  Serial.println("[WiFi] HTTP server listening on port 80 (STA mode)");
 }
 
-// ═════════════════════════════════════════════════════════════════════
-//  SETUP & LOOP
-// ═════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  SERIAL DIAGNOSTICS — periodic print
+// ═══════════════════════════════════════════════════════════════════
+uint32_t lastDiagMs = 0;
+#define  DIAG_INTERVAL_MS 5000
 
+void printDiagnostics() {
+  uint32_t now = millis();
+  if (now - lastDiagMs < DIAG_INTERVAL_MS) return;
+  lastDiagMs = now;
+
+  Serial.println("──── Lightboard Diagnostics ────");
+  Serial.printf("[BOARD] %s\n", IS_FRONT_BOARD ? "FRONT" : "REAR");
+  Serial.printf("[CAN]   cmd=0x%04X valid=%d age=%lu ms\n",
+                canCmdBits, canCmdValid,
+                canCmdValid ? (now - lastCanCmdMs) : 0UL);
+#if IS_FRONT_BOARD
+  Serial.printf("[SMART] current=%d desired=%d edgeActive=%d\n",
+                slCurrent, slDesired, slEdgeActive);
+#endif
+  Serial.printf("[CURR]  ");
+  for (int i = 0; i < 8; i++) Serial.printf("S%d=%dmA ", i, currentMa[i]);
+  Serial.println();
+  Serial.printf("[LUX]   %.1f lux\n", ambientLux);
+  Serial.printf("[SONAR] L=%d C=%d R=%d cm\n",
+                sonar[0].distanceCm, sonar[1].distanceCm, sonar[2].distanceCm);
+  Serial.printf("[PERIPH] MCP=%d ADS0=%d ADS1=%d VEML=%d\n",
+                mcp_ok, ads0_ok, ads1_ok, veml_ok);
+  Serial.printf("[UP]    %lu s\n", now / 1000);
+  Serial.println("────────────────────────────────");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  delay(200);
-  pinMode(PIN_CAN_S, OUTPUT);
-  digitalWrite(PIN_CAN_S, LOW);
-  serialLogPush("[BOOT] init");
-
-  loadPersistentConfig();
+  delay(500);
+  Serial.println("\n========================================");
+  Serial.printf(" Velion Lightboard Firmware — %s\n", IS_FRONT_BOARD ? "FRONT" : "REAR");
+  Serial.println("========================================");
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  lastAnyCanRxMs = millis();
 
-  setupMcp();
-  setupSensors();
-  logf("[I2C] MCP=%s ADS48=%s ADS49=%s VEML=%s",
-       mcpOk ? "OK" : "FAIL", ads48Ok ? "OK" : "FAIL",
-       ads49Ok ? "OK" : "FAIL", vemlOk ? "OK" : "FAIL");
+  setupGPIO();
   setupCAN();
-  setupWeb();
+  setupMCP();
+  setupADS();
+  setupVEML();
+  setupNeoPixel();
+  sonarInit();
+  setupWiFi();
 
-  logf("[BOOT] AP=%s  5FF=%s", apSsid, can5ffEnabled ? "ON" : "OFF");
+  Serial.println("[BOOT] Ready.\n");
 }
 
 void loop() {
